@@ -1,0 +1,14 @@
+*.iml
+.gradle/
+.kotlin/
+.idea/
+local.properties
+**/build/
+work/
+outputs/
+.codex-remote-attachments/
+captures/
+.externalNativeBuild/
+.cxx/
+.signing/
+keystore.properties

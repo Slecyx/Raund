@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Raund</string>
+    <string name="widget_brand">RAUND</string>
+    <string name="widget_description">Matches, store and rank at a glance</string>
+    <string name="widget_store_description">Daily offers and Night Market</string>
+    <string name="widget_match_description">Followed matches or all matches with live scores</string>
+    <string name="widget_career_description">Rank, RR and recent competitive matches</string>
+    <string name="widget_store_name">Raund · Store</string>
+    <string name="widget_match_name">Raund · Matches</string>
+    <string name="widget_career_name">Raund · Career</string>
+    <string name="widget_refresh">Refresh widget</string>
+    <string name="widget_configure">Configure widget</string>
+</resources>

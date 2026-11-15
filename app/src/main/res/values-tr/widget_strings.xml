@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">Raund</string>
+    <string name="widget_brand">RAUND</string>
+    <string name="widget_description">Maç, mağaza ve rank tek bakışta</string>
+    <string name="widget_store_description">Günlük teklifler ve Gece Pazarı</string>
+    <string name="widget_match_description">Takip edilen veya tüm maçların canlı skorları</string>
+    <string name="widget_career_description">Rank, RR ve son dereceli maçlar</string>
+    <string name="widget_store_name">Raund · Mağaza</string>
+    <string name="widget_match_name">Raund · Maçlar</string>
+    <string name="widget_career_name">Raund · Kariyer</string>
+    <string name="widget_refresh">Widget’ı yenile</string>
+    <string name="widget_configure">Widget’ı düzenle</string>
+</resources>

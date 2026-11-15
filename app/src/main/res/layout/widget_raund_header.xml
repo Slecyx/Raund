@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:layout_width="match_parent" android:layout_height="26dp" android:gravity="center_vertical" android:orientation="horizontal">
+    <ImageView android:id="@+id/widget_logo" android:layout_width="16dp" android:layout_height="16dp" android:contentDescription="@string/app_name" android:src="@drawable/ic_notification" android:tint="#F4F3EF" />
+    <TextView android:id="@+id/widget_eyebrow" android:layout_width="0dp" android:layout_height="wrap_content" android:layout_marginStart="6dp" android:layout_weight="1" android:ellipsize="end" android:fontFamily="sans-serif-medium" android:maxLines="1" android:text="@string/widget_brand" android:textColor="#B4B3B6" android:textSize="11sp" />
+    <TextView android:id="@+id/widget_badge" android:layout_width="wrap_content" android:layout_height="wrap_content" android:fontFamily="sans-serif-medium" android:maxLines="1" android:textColor="#F4F3EF" android:textSize="10sp" />
+    <ImageView android:id="@+id/widget_refresh" android:layout_width="28dp" android:layout_height="26dp" android:padding="5dp" android:contentDescription="@string/widget_refresh" android:src="@drawable/ic_widget_refresh" />
+    <ImageView android:id="@+id/widget_config" android:layout_width="28dp" android:layout_height="26dp" android:padding="5dp" android:contentDescription="@string/widget_configure" android:src="@drawable/ic_widget_settings" />
+</LinearLayout>
