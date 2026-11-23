@@ -18,7 +18,9 @@ internal object WatchLater {
         }
     fun decode(raw: String): List<WatchLaterEntry> {
         require(raw.length <= 200_000)
-        return sanitize(Gson().fromJson(raw, Array<WatchLaterEntry>::class.java).toList())
+        val parsed = Gson().fromJson(raw, Array<WatchLaterEntry?>::class.java)?.toList()
+            ?: throw IllegalArgumentException("Invalid watch later list")
+        return sanitize(parsed.filterNotNull().filter { (it.match as EsportsMatch?) != null })
     }
     fun get(context: Context): List<WatchLaterEntry> = runCatching {
         decode(context.getSharedPreferences("nightwatch", 0).getString(KEY, "[]") ?: "[]")

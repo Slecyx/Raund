@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -40,6 +41,7 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun EsportsPage(favorites: Set<String>, onTeam: (String) -> Unit,
                                     favoritePlayers: Set<String>, onPlayerFavorite: (String) -> Unit, trackedId: String?,
                                     onTracked: (String?) -> Unit, matchAlerts: Boolean, onSettings: () -> Unit,
@@ -57,7 +59,9 @@ import java.util.Locale
     val routePrefs = remember { context.getSharedPreferences("nightwatch", 0) }
     var selected by rememberSaveable { mutableStateOf(routePrefs.getString("esports_last_filter", null)
         ?: if(favorites.isNotEmpty()) "followed" else "upcoming") }
-    var matchFilterOpen by remember { mutableStateOf(false) }
+    var tierOneOnly by rememberSaveable { mutableStateOf(routePrefs.getBoolean("esports_tier1_only", false)) }
+    var regionFilter by rememberSaveable { mutableStateOf(routePrefs.getString("esports_region_filter", "all") ?: "all") }
+    var matchQuery by rememberSaveable { mutableStateOf("") }
     var section by rememberSaveable { mutableStateOf(routePrefs.getString("esports_last_section", "matches") ?: "matches") }
     var eventQuery by rememberSaveable { mutableStateOf("") }
     var eventFilter by rememberSaveable { mutableStateOf("live") }
@@ -306,12 +310,19 @@ import java.util.Locale
         } ?: match }
         .sortedWith(compareBy<EsportsMatch> { when(it.status) { "live" -> 0; "upcoming" -> 1; else -> 2 } }
             .thenBy { it.startAtMillis ?: Long.MAX_VALUE })
-    val list = when(selected) { "watch_later" -> emptyList(); "upcoming" -> freshMatches.filter { it.status == "upcoming" }; "results" -> freshMatches.filter { it.status == "result" }; "saved" -> currentSaved; "followed" -> followed;
+    val rawList = when(selected) { "watch_later" -> emptyList(); "upcoming" -> freshMatches.filter { it.status == "upcoming" }; "results" -> freshMatches.filter { it.status == "result" }; "saved" -> currentSaved; "followed" -> followed;
         else -> freshMatches.filter { it.status == "live" } }
-    val nextSpotlight = if(selected == "live" && list.isEmpty())
-        (followed.filter { it.status == "upcoming" } + freshMatches.filter { it.status == "upcoming" }).distinctBy { it.id }
+    val list = remember(rawList, tierOneOnly, regionFilter, matchQuery, selected) {
+        if(selected in setOf("saved", "followed", "watch_later")) EsportsTierFilter.filter(rawList, false, "all", matchQuery)
+        else EsportsTierFilter.filter(rawList, tierOneOnly, regionFilter, matchQuery)
+    }
+    val liveCount = remember(freshMatches, tierOneOnly, regionFilter) {
+        EsportsTierFilter.filter(freshMatches.filter { it.status == "live" }, tierOneOnly, regionFilter, "").size
+    }
+    val nextSpotlight = if(selected == "live" && list.isEmpty() && matchQuery.isBlank())
+        (followed.filter { it.status == "upcoming" } + EsportsTierFilter.filter(freshMatches.filter { it.status == "upcoming" }, tierOneOnly, regionFilter, "")).distinctBy { it.id }
             .minByOrNull { it.startAtMillis ?: Long.MAX_VALUE } else null
-    val displayList = if(nextSpotlight != null) freshMatches.filter { it.status == "upcoming" && it.id != nextSpotlight.id }.take(4) else list
+    val displayList = if(nextSpotlight != null) EsportsTierFilter.filter(freshMatches.filter { it.status == "upcoming" && it.id != nextSpotlight.id }, tierOneOnly, regionFilter, "").take(4) else list
     val followedNews = remember(news, favorites, followedPlayerProfiles) {
         val terms = (favorites + followedPlayerProfiles.map { it.player.name }).filter { it.length >= 3 }
         news.filter { story -> terms.any { term -> story.title.contains(term, true) || story.summary.contains(term, true) } }.take(6)
@@ -324,29 +335,31 @@ import java.util.Locale
             showEsportsGuide = false
             esportsPrefs.edit().putBoolean("esports_guide_seen_v2", true).apply()
         }) { Text(txt("Got it", "Anladım")) } })
-    LazyColumn(contentPadding = PaddingValues(horizontal = 20.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    val onPullRefresh: () -> Unit = {
+        if(section == "matches") refresh(true) else scope.launch {
+            exploreLoading = true
+            runCatching {
+                when(section) {
+                    "events" -> events = explore.events(true)
+                    "news" -> news = explore.news(true)
+                    "teams" -> if(teamQuery.trim().length >= 2) {
+                        if(directoryKind == "teams") teamResults = explore.searchTeams(teamQuery)
+                        else playerResults = explore.searchPlayers(teamQuery)
+                    }
+                    else -> Unit
+                }
+            }
+                .onSuccess { exploreError = false }.onFailure { exploreError = true }
+            exploreLoading = false
+        }
+    }
+    PullToRefreshBox(isRefreshing = refreshing || loading || exploreLoading, onRefresh = onPullRefresh, modifier = Modifier.fillMaxSize()) {
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         item {
             EsportsTopHeader(spoilerMode, onGuide = { showEsportsGuide = !showEsportsGuide }, onSpoiler = {
                 spoilerMode = !spoilerMode
                 SpoilerPolicy.change(context, spoilerMode)
-            }, onRefresh = {
-                if(section == "matches") refresh(true) else scope.launch {
-                    exploreLoading = true
-                    runCatching {
-                        when(section) {
-                            "events" -> events = explore.events(true)
-                            "news" -> news = explore.news(true)
-                            "teams" -> if(teamQuery.trim().length >= 2) {
-                                if(directoryKind == "teams") teamResults = explore.searchTeams(teamQuery)
-                                else playerResults = explore.searchPlayers(teamQuery)
-                            }
-                            else -> Unit
-                        }
-                    }
-                        .onSuccess { exploreError = false }.onFailure { exploreError = true }
-                    exploreLoading = false
-                }
-            })
+            }, onRefresh = onPullRefresh)
             if(loading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Accent)
             if(exploreLoading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Accent)
             if(error && section == "matches" || exploreError && section != "matches") Note(txt("Could not update VLR.gg. Showing saved data if available.","VLR.gg güncellenemedi. Varsa kaydedilmiş veriler gösteriliyor."))
@@ -357,26 +370,45 @@ import java.util.Locale
                 EsportsTab(txt("News","Haberler"), section == "news", Modifier.weight(1f)) { section = "news" }
             }
             if(section == "matches") {
-                val filters = listOf("live" to txt("Live", "Canlı"), "upcoming" to txt("Upcoming", "Yaklaşan"),
-                    "results" to txt("Results", "Sonuçlar"), "followed" to txt("For you", "Sana özel"), "saved" to txt("Saved", "Kaydedilen"),
-                    "watch_later" to txt("Watch later", "Sonra izle"))
-                Row(Modifier.fillMaxWidth().padding(top = 5.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.weight(1f)) {
-                        TextButton(onClick = { matchFilterOpen = true }) {
-                            Text((filters.firstOrNull { it.first == selected }?.second ?: txt("Matches", "Maçlar")) + "  ▾", color = Accent, fontSize = 15.sp)
+                val filters = listOf(
+                    "live" to (txt("Live", "Canlı") + if(liveCount > 0) " ($liveCount)" else ""),
+                    "upcoming" to txt("Upcoming", "Yaklaşan"),
+                    "results" to txt("Results", "Sonuçlar"),
+                    "followed" to txt("For you", "Sana özel"),
+                    "saved" to txt("Saved", "Kaydedilen"),
+                    "watch_later" to txt("Watch later", "Sonra izle")
+                )
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    filters.forEach { (value, label) -> Chip(label, selected == value) { selected = value } }
+                }
+                if(selected in setOf("live", "upcoming", "results")) {
+                    Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                        Chip(txt("VCT / Tier-1", "Sadece VCT"), tierOneOnly) {
+                            tierOneOnly = !tierOneOnly
+                            routePrefs.edit().putBoolean("esports_tier1_only", tierOneOnly).apply()
                         }
-                        DropdownMenu(matchFilterOpen, onDismissRequest = { matchFilterOpen = false }) {
-                            filters.forEach { (value, label) -> DropdownMenuItem(text = { Text(label) },
-                                onClick = { selected = value; matchFilterOpen = false }) }
+                        listOf("all" to txt("All regions", "Tüm bölgeler"), "intl" to "Masters/Champs", "emea" to "EMEA", "americas" to "Americas", "pacific" to "Pacific", "cn" to "CN").forEach { (key, label) ->
+                            Chip(label, regionFilter == key) {
+                                regionFilter = key
+                                routePrefs.edit().putString("esports_region_filter", key).apply()
+                            }
                         }
                     }
+                }
+                if(selected != "watch_later") {
+                    OutlinedTextField(matchQuery, { matchQuery = it }, Modifier.fillMaxWidth().padding(top = 8.dp), singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        placeholder = { Text(txt("Search team or tournament", "Takım veya turnuva ara"), color = Muted, fontSize = 13.sp) },
+                        trailingIcon = { if(matchQuery.isNotEmpty()) TextButton(onClick = { matchQuery = "" }) { Text("×") } })
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(if(selected == "watch_later") txt("Private replay list · No notifications", "Kişisel izleme listesi · Bildirim göndermez") else txt("Last checked ", "Son kontrol ") +
+                        ((if(selected == "results") freshFeed?.resultsCheckedAt else freshFeed?.checkedAt)?.takeIf { it > 0 }?.let { timeLabel(it) } ?: "—"), color = Muted, fontSize = 12.sp,
+                        modifier = Modifier.weight(1f))
                     if(selected == "watch_later") TextButton(onClick = { showWatched = !showWatched }) {
                         Text(if(showWatched) txt("Watched", "İzlenenler") else txt("To watch", "İzlenecekler"))
                     } else Text("${list.size} " + txt(if(list.size == 1) "match" else "matches", "maç"), color = Muted, fontSize = 12.sp)
                 }
-                Text(if(selected == "watch_later") txt("Private replay list · No notifications", "Kişisel izleme listesi · Bildirim göndermez") else txt("Last checked ", "Son kontrol ") +
-                    ((if(selected == "results") freshFeed?.resultsCheckedAt else freshFeed?.checkedAt)?.takeIf { it > 0 }?.let(::timeLabel) ?: "—"), color = Muted, fontSize = 12.sp,
-                    modifier = Modifier.padding(vertical = 8.dp))
                 if(freshFeed?.partialResults == true && selected == "results") Note(txt("Results could not be refreshed; showing the last saved results.",
                     "Sonuçlar güncellenemedi; son kaydedilen sonuçlar gösteriliyor."))
                 if(nextSpotlight != null) EsportsSpotlight(nextSpotlight, favorites, spoilerMode,
@@ -552,6 +584,7 @@ import java.util.Locale
         }
         }
         item { Spacer(Modifier.height(8.dp)) }
+    }
     }
 }
 
@@ -849,13 +882,26 @@ internal fun esportsDisplayWhen(source: String, turkish: Boolean): String {
                 if(hideScores) TextButton(onClick = { spoilersRevealed = true }, modifier = Modifier.align(Alignment.CenterHorizontally)) {
                     Text(txt("Reveal result", "Sonucu göster"))
                 }
+                Row(Modifier.align(Alignment.CenterHorizontally), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if(match.status == "upcoming" && match.startAtMillis != null) {
+                        TextButton(onClick = { ShareSummaries.addMatchToCalendar(context, match) }) {
+                            Text(txt("Add to calendar", "Takvime ekle"), fontSize = 12.sp)
+                        }
+                    }
+                    TextButton(onClick = {
+                        ShareSummaries.shareText(context, "${match.team1} vs ${match.team2}",
+                            ShareSummaries.esportsMatchSummary(match, hideScores, tr))
+                    }) { Text(txt("Share ↗", "Paylaş ↗"), fontSize = 12.sp) }
+                }
             }
         }
         if(detailError && detail != null) item { Note(txt("Update failed · showing saved match details.", "Yenilenemedi · kaydedilen maç bilgileri gösteriliyor.")) }
         item { val checked = EsportsRepository(context).cachedDetailAt(match.id)
             Text(txt("Source: VLR.gg · Checked ", "Kaynak: VLR.gg · Kontrol ") + if(checked > 0) timeLabel(checked) else "—", color = Muted, fontSize = 12.sp) }
         if(match.status == "upcoming" || pickem != null) item {
-            SectionTitle(txt("Private Pick'em", "Kişisel Pick'em"))
+            val pickemStats = remember(pickem, match.id) { PickemStore.summary(context, WidgetModels.matches(context)) }
+            val pickemSuffix = pickemStats.accuracyPercent?.let { "${pickemStats.correct}/${pickemStats.decided} · %$it" }.orEmpty()
+            SectionTitle(txt("Private Pick'em", "Kişisel Pick'em"), pickemSuffix)
             Text(txt("Your local prediction · no money, odds or public leaderboard", "Cihazındaki tahminin · para, oran veya genel sıralama yok"),
                 color = Muted, fontSize = 10.sp, modifier = Modifier.padding(bottom = 9.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
@@ -952,6 +998,26 @@ internal fun esportsDisplayWhen(source: String, turkish: Boolean): String {
                             onClick = { statsMap = name }, label = { Text(if(name == "all") txt("All maps","Tüm haritalar") else name) }) }
                     }
                 }
+                if(!hideScores && statsMap != "all") {
+                    val mapLines = detail?.mapPlayers?.get(statsMap).orEmpty()
+                    val comp1 = mapLines.filter { it.team == match.team1 }.mapNotNull { it.agentIcon }.take(5)
+                    val comp2 = mapLines.filter { it.team == match.team2 }.mapNotNull { it.agentIcon }.take(5)
+                    if(comp1.isNotEmpty() || comp2.isNotEmpty()) item {
+                        Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+                            Text(txt("Agent compositions · $statsMap", "Ajan kompozisyonları · $statsMap"), color = Muted, fontSize = 11.sp, modifier = Modifier.padding(bottom = 8.dp))
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    comp1.forEach { icon -> coil.compose.AsyncImage(icon, null, Modifier.size(28.dp).clip(CircleShape).background(Raised), contentScale = ContentScale.Crop) }
+                                }
+                                Text("VS", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(horizontal = 6.dp))
+                                Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.End)) {
+                                    comp2.forEach { icon -> coil.compose.AsyncImage(icon, null, Modifier.size(28.dp).clip(CircleShape).background(Raised), contentScale = ContentScale.Crop) }
+                                }
+                            }
+                        }
+                        HorizontalDivider(color = Raised.copy(alpha = .5f))
+                    }
+                }
                 if(detail?.players.orEmpty().isEmpty()) item { Note(txt("Player stats are not available yet.",
                     "Oyuncu istatistikleri henüz yayımlanmadı.")) }
                 listOf(match.team1, match.team2).forEach { team ->
@@ -1001,7 +1067,7 @@ internal fun esportsDisplayWhen(source: String, turkish: Boolean): String {
                     detail?.vods.orEmpty().map { Triple(it.first, it.second, "VOD") }
                 if(links.isEmpty()) item { Note(txt("No stream or replay link was supplied.","Yayın veya tekrar bağlantısı verilmedi.")) }
                 items(links) { (label, url, kind) ->
-                    Row(Modifier.fillMaxWidth().clickable { runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) } }
+                    Row(Modifier.fillMaxWidth().clickable { openHttpsUrl(context, url) }
                         .padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(label, color = White, fontSize = 14.sp)
@@ -1014,7 +1080,7 @@ internal fun esportsDisplayWhen(source: String, turkish: Boolean): String {
             }
         }
         item {
-            TextButton(onClick = { runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(match.url))) } }) {
+            TextButton(onClick = { openHttpsUrl(context, match.url) }) {
                 Text(txt("Source · VLR.gg ↗","Kaynak · VLR.gg ↗"))
             }
         }

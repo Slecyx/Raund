@@ -53,7 +53,17 @@ internal object NewsArticleParser {
             val cached = prefs.getString(key, null)?.let { raw -> runCatching { val array = JSONArray(raw); (0 until array.length()).map { array.getString(it) } }.getOrNull() }
             if(retry == 0 && !cached.isNullOrEmpty()) cached else {
                 val html = Jsoup.connect("https://www.vlr.gg$path").userAgent("Raund Android companion").timeout(15000).maxBodySize(1_500_000).get().outerHtml()
-                NewsArticleParser.paragraphs(html).also { prefs.edit().putString(key, JSONArray(it).toString()).apply() }
+                NewsArticleParser.paragraphs(html).also {
+                    prefs.edit().apply {
+                        putString(key, JSONArray(it).toString())
+                        putLong("${key}_at", System.currentTimeMillis())
+                        prefs.all.entries
+                            .filter { entry -> entry.key.endsWith("_at") && entry.value is Long && entry.key != "${key}_at" }
+                            .sortedByDescending { entry -> entry.value as Long }
+                            .drop(40)
+                            .forEach { (atKey, _) -> remove(atKey); remove(atKey.removeSuffix("_at")) }
+                    }.apply()
+                }
             }
         } }.onSuccess { paragraphs = it }.onFailure { failed = true }
         loading = false

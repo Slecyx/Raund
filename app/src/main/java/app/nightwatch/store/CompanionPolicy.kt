@@ -31,9 +31,22 @@ internal object SpoilerPolicy {
 
 internal object MatchNavigation {
     const val EXTRA = "raund_match"
-    fun valid(match: EsportsMatch): Boolean = Regex("^[0-9]{1,12}$").matches(match.id) &&
-        match.team1.isNotBlank() && match.team1.length <= 120 && match.team2.isNotBlank() && match.team2.length <= 120 &&
-        match.status in setOf("live", "upcoming", "result", "cancelled", "postponed")
+    fun valid(match: EsportsMatch?): Boolean {
+        if(match == null) return false
+        // Gson bypasses Kotlin null-safety when deserializing untrusted JSON.
+        val id: String? = match.id
+        val team1: String? = match.team1
+        val team2: String? = match.team2
+        val status: String? = match.status
+        val event: String? = match.event
+        val series: String? = match.series
+        val whenText: String? = match.whenText
+        return id != null && Regex("^[0-9]{1,12}$").matches(id) &&
+            !team1.isNullOrBlank() && team1.length <= 120 &&
+            !team2.isNullOrBlank() && team2.length <= 120 &&
+            status in setOf("live", "upcoming", "result", "cancelled", "postponed") &&
+            event != null && series != null && whenText != null
+    }
     fun intent(context: Context, match: EsportsMatch): Intent = Intent(context, MainActivity::class.java)
         .setData(Uri.parse("raund://match/${match.id}"))
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
@@ -79,4 +92,11 @@ class LiveCardDismissReceiver : android.content.BroadcastReceiver() {
         val prefs = context.getSharedPreferences("nightwatch", 0)
         prefs.edit().putStringSet("live_card_dismissed", (prefs.getStringSet("live_card_dismissed", emptySet()).orEmpty() + ids).toList().takeLast(100).toSet()).commit()
     }
+}
+
+/** Opens only verified HTTPS web links in a browsable activity without crashing if none exists. */
+internal fun openHttpsUrl(context: Context, rawUrl: String) {
+    val uri = runCatching { Uri.parse(rawUrl) }.getOrNull() ?: return
+    if(uri.scheme != "https" || uri.host.isNullOrBlank()) return
+    runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE)) }
 }

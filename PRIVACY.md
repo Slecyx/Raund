@@ -13,7 +13,7 @@ Raund is designed to process account and preference data on the device. It does 
 
 ## Network requests
 
-The app connects directly to Riot authentication/game-client endpoints after an account connection, to public VALORANT metadata, and to its configured eSports source. Raund has no intermediary server.
+The app connects directly to Riot authentication/game-client endpoints after an account connection, to Riot's public server-status and PlayValorant patch-notes pages, to public VALORANT metadata (`valorant-api.com`), to its configured eSports source (`vlr.gg`), and to privacy-enhanced YouTube embeds (`youtube-nocookie.com`) when you open lineup videos. Raund has no intermediary server.
 
 ## Notifications
 

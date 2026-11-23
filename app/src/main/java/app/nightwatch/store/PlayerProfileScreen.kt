@@ -310,7 +310,7 @@ internal object PlayerAnalytics {
             profile?.socials?.take(3)?.forEach { social ->
                 val context = LocalContext.current
                 Text(social.label, color = White, fontSize = 11.sp, modifier = Modifier.clickable {
-                    runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(social.url))) }
+                    openHttpsUrl(context, social.url)
                 }.padding(top = 5.dp))
             }
         }

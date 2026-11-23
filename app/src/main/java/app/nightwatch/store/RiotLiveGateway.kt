@@ -95,7 +95,9 @@ class RiotLiveGateway(private val context: Context) {
     suspend fun loadStore(session: RiotSession, includeDetails: Boolean = true, historyLimit: Int = 20, onStoreReady: suspend (LiveStoreAccount) -> Unit = {}): LiveStoreAccount = withContext(Dispatchers.IO) {
         val authHeaders = mapOf("Authorization" to "Bearer ${session.accessToken}")
         val user = stage("Riot account") { requestJson("https://auth.riotgames.com/userinfo", "GET", authHeaders) }
-        val puuid = user.getString("sub")
+        // Every value below is interpolated into request URLs that carry the bearer token. Reject
+        // anything that is not exactly the expected shape instead of trusting the response.
+        val puuid = user.getString("sub").takeIf(::isRiotId) ?: error("Riot hesabı beklenmeyen kimlik döndürdü")
         val account = user.optJSONObject("acct")
         val accountName = listOfNotNull(account?.optString("game_name"), account?.optString("tag_line"))
             .filter { it.isNotBlank() }.joinToString("#").ifBlank { "Riot player" }
@@ -108,7 +110,7 @@ class RiotLiveGateway(private val context: Context) {
             requestJson(
                 "https://riot-geo.pas.si.riotgames.com/pas/v1/product/valorant", "PUT", authHeaders,
                 JSONObject().put("id_token", session.idToken).toString()
-            ).getJSONObject("affinities").getString("live")
+            ).getJSONObject("affinities").getString("live").lowercase().also { require(it in SHARDS) { "Unexpected shard" } }
         }.getOrElse {
             // Riot's geo edge occasionally serves a certificate chain Android cannot complete.
             // Authentication has already succeeded at this point, so derive a conservative shard
@@ -196,6 +198,84 @@ class RiotLiveGateway(private val context: Context) {
         return OwnedInventory(ids, System.currentTimeMillis())
     }
 
+    private data class RiotClientContext(val puuid: String, val region: String, val headers: Map<String, String>)
+
+    private fun resolveClientContext(session: RiotSession): RiotClientContext {
+        val authHeaders = mapOf("Authorization" to "Bearer ${session.accessToken}")
+        val user = stage("Riot account") { requestJson("https://auth.riotgames.com/userinfo", "GET", authHeaders) }
+        val puuid = user.getString("sub").takeIf(::isRiotId) ?: error("Riot hesabı beklenmeyen kimlik döndürdü")
+        val entitlement = stage("Riot entitlement") {
+            requestJson("https://entitlements.auth.riotgames.com/api/token/v1", "POST", authHeaders, "{}").getString("entitlements_token")
+        }
+        val region = runCatching {
+            requestJson(
+                "https://riot-geo.pas.si.riotgames.com/pas/v1/product/valorant", "PUT", authHeaders,
+                JSONObject().put("id_token", session.idToken).toString()
+            ).getJSONObject("affinities").getString("live").lowercase().also { require(it in SHARDS) { "Unexpected shard" } }
+        }.getOrElse { fallbackRegion(user.optString("country")) }
+        val version = stage("Client version") { requestJson("https://valorant-api.com/v1/version", "GET") }
+            .getJSONObject("data").optString("riotClientVersion", "release-01.00-shipping-1-1")
+        val headers = authHeaders + mapOf(
+            "X-Riot-Entitlements-JWT" to entitlement,
+            "X-Riot-ClientVersion" to version,
+            "X-Riot-ClientPlatform" to CLIENT_PLATFORM
+        )
+        return RiotClientContext(puuid, region, headers)
+    }
+
+    suspend fun loadStoreOfferPrices(session: RiotSession): Map<String, Int> = withContext(Dispatchers.IO) {
+        val ctx = resolveClientContext(session)
+        val response = requestJson("https://pd.${ctx.region}.a.pvp.net/store/v1/offers/", "GET", ctx.headers)
+        val prices = mutableMapOf<String, Int>()
+        response.optJSONArray("Offers").objects().forEach { offer ->
+            val cost = StorePricing.cost(offer.optJSONObject("Cost"), StorePricing.VP)
+            if(cost > 0) {
+                offer.optJSONArray("Rewards").objects().forEach { reward ->
+                    val itemId = reward.optString("ItemID").trim().lowercase()
+                    if(itemId.isNotBlank()) prices[itemId] = cost
+                }
+            }
+        }
+        prices
+    }
+
+    suspend fun loadPlayerLoadout(session: RiotSession): PlayerLoadoutSnapshot = withContext(Dispatchers.IO) {
+        val ctx = resolveClientContext(session)
+        val loadout = requestJson("https://pd.${ctx.region}.a.pvp.net/personalization/v2/players/${ctx.puuid}/playerloadout", "GET", ctx.headers)
+        val skinLevels = runCatching {
+            InventoryParser.skinLevels(requestJson("https://pd.${ctx.region}.a.pvp.net/store/v1/entitlements/${ctx.puuid}/e7c63390-eda7-46e0-bb7a-a6abdacd2433", "GET", ctx.headers))
+        }.getOrDefault(emptyList()).toSet()
+        val chromas = runCatching {
+            val raw = requestJson("https://pd.${ctx.region}.a.pvp.net/store/v1/entitlements/${ctx.puuid}/3ad1b2b2-acdb-4524-852f-954a76ddae0a", "GET", ctx.headers)
+            raw.optJSONArray("Entitlements").objects().mapNotNull { it.optString("ItemID").trim().lowercase().takeIf(String::isNotBlank) }
+        }.getOrDefault(emptyList()).toSet()
+        PlayerLoadoutSnapshot(loadout.toString(), skinLevels, chromas, ctx.region, ctx.puuid)
+    }
+
+    suspend fun updatePlayerLoadout(session: RiotSession, updatedLoadoutJson: String): JSONObject = withContext(Dispatchers.IO) {
+        val ctx = resolveClientContext(session)
+        val payload = JSONObject(updatedLoadoutJson).apply {
+            // Riot's PUT loadout endpoint expects only mutable loadout fields, not Subject/Version.
+            remove("Subject")
+            remove("Version")
+        }
+        requestJson("https://pd.${ctx.region}.a.pvp.net/personalization/v2/players/${ctx.puuid}/playerloadout", "PUT", ctx.headers, payload.toString())
+    }
+
+    suspend fun lookupPlayerProfile(session: RiotSession, targetPuuid: String): LookedUpPlayer = withContext(Dispatchers.IO) {
+        require(isRiotId(targetPuuid)) { "Invalid Riot PUUID" }
+        val ctx = resolveClientContext(session)
+        val resolvedName = runCatching {
+            val names = requestJson("https://pd.${ctx.region}.a.pvp.net/name-service/v2/players", "PUT", ctx.headers, JSONArray().put(targetPuuid).toString())
+            val first = names.optJSONArray("_array")?.optJSONObject(0)
+            val gn = first?.optString("GameName").orEmpty()
+            val tl = first?.optString("TagLine").orEmpty()
+            if(gn.isNotBlank()) "$gn#$tl" else null
+        }.getOrNull()
+        val career = loadCareer(ctx.region, targetPuuid, ctx.headers, 8)
+        LookedUpPlayer(targetPuuid, resolvedName ?: "Player ${targetPuuid.take(6)}", ctx.region.uppercase(), career)
+    }
+
     private suspend fun loadCareer(region: String, puuid: String, headers: Map<String, String>, limit: Int): CareerSummary {
         val updates = runCatching {
             requestJson("https://pd.$region.a.pvp.net/mmr/v1/players/$puuid/competitiveupdates?startIndex=0&endIndex=12", "GET", headers)
@@ -224,7 +304,7 @@ class RiotLiveGateway(private val context: Context) {
         val matches = coroutineScope { (0 until history.length()).map { index -> async { limiter.withPermit {
             val item = history.optJSONObject(index) ?: return@withPermit null
             val matchId = item.optString("MatchID")
-            if (matchId.isBlank()) return@withPermit null
+            if (!isRiotId(matchId)) return@withPermit null
             val details = cachedMatches[matchId]?.detailsJson?.let { runCatching { JSONObject(it) }.getOrNull() } ?: runCatching {
                 requestJson("https://pd.$region.a.pvp.net/match-details/v1/matches/$matchId", "GET", headers)
             }.getOrNull()
@@ -386,7 +466,7 @@ class RiotLiveGateway(private val context: Context) {
         if (id.isBlank()) return null
         val cost = StorePricing.cost(objectValue?.optJSONObject("Cost"))
         runCatching { catalog.skins().find { it.id == id } }.getOrNull()?.let { return it.copy(priceVp = cost) }
-        val metadata = runCatching {
+        val metadata = if (!isRiotId(id)) null else runCatching {
             requestJson("https://valorant-api.com/v1/weapons/skinlevels/$id", "GET").getJSONObject("data")
         }.getOrNull()
         val displayName = metadata?.optString("displayName")?.takeIf { it.isNotBlank() } ?: "Store offer"
@@ -436,6 +516,8 @@ class RiotLiveGateway(private val context: Context) {
                 connection.sslSocketFactory = riotStoreSslContext.socketFactory
             }
             connection.requestMethod = method
+            // Authenticated requests must never be replayed to a redirect target.
+            connection.instanceFollowRedirects = false
             connection.connectTimeout = 15_000
             connection.readTimeout = 20_000
             connection.setRequestProperty("Accept", "application/json")
@@ -447,10 +529,20 @@ class RiotLiveGateway(private val context: Context) {
                 connection.outputStream.bufferedWriter().use { it.write(body) }
             }
             val code = connection.responseCode
-            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-            val text = stream?.bufferedReader()?.use { it.readText() }.orEmpty()
             if (code == 401) throw LoginRequired()
             if (code !in 200..299) error("Riot servisi HTTP $code")
+            val text = connection.inputStream.bufferedReader().use { reader ->
+                // A broken or hostile edge must not be able to exhaust memory with one response.
+                val output = StringBuilder()
+                val buffer = CharArray(8_192)
+                while (true) {
+                    val count = reader.read(buffer)
+                    if (count < 0) break
+                    if (output.length + count > MAX_RESPONSE_CHARS) error("Riot servisi yanıtı çok büyük")
+                    output.append(buffer, 0, count)
+                }
+                output.toString()
+            }
             val payload = text.trim()
             return if (payload.startsWith("[")) {
                 JSONObject().put("_array", JSONArray(payload))
@@ -465,7 +557,9 @@ class RiotLiveGateway(private val context: Context) {
     private inline fun <T> stage(name: String, block: () -> T): T = try {
         block()
     } catch (error: Exception) {
-        Log.e("NightwatchNetwork", name, error)
+        // Network exceptions may contain request-specific data. Keep release logs diagnostic but
+        // avoid emitting URLs, response snippets, cookie values, or exception payloads.
+        Log.e("NightwatchNetwork", name)
         throw IllegalStateException("$name: ${error.message ?: error.javaClass.simpleName}", error)
     }
 
@@ -504,6 +598,10 @@ class RiotLiveGateway(private val context: Context) {
     }
 
     companion object {
+        private const val MAX_RESPONSE_CHARS = 16 * 1024 * 1024
+        private val SHARDS = setOf("na", "latam", "br", "eu", "ap", "kr", "pbe")
+        private val RIOT_ID = Regex("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+        internal fun isRiotId(value: String?): Boolean = value != null && RIOT_ID.matches(value)
         private const val CLIENT_PLATFORM = "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9TVmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24iDQp9"
     }
 }

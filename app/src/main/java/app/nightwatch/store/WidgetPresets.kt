@@ -7,11 +7,15 @@ internal data class WidgetPreset(val mode: String, val all: Boolean, val match: 
 internal object WidgetPresets {
     fun decode(raw: String): List<WidgetPreset> {
         require(raw.length <= 10_000)
-        val values = Gson().fromJson(raw, Array<WidgetPreset>::class.java).toList()
+        val values = Gson().fromJson(raw, Array<WidgetPreset?>::class.java)?.toList()
+            ?: throw IllegalArgumentException("Invalid widget presets")
         require(values.size <= 32)
-        require(values.all { it.mode in setOf("auto", "store", "night", "matches", "career") &&
-            (it.match == null || Regex("^[0-9]{1,12}$").matches(it.match)) })
-        return values.distinct()
+        require(values.all { preset ->
+            preset != null &&
+                (preset.mode as String?) in setOf("auto", "store", "night", "matches", "career") &&
+                (preset.match == null || Regex("^[0-9]{1,12}$").matches(preset.match))
+        })
+        return values.filterNotNull().distinct()
     }
     fun capture(context: Context): String {
         val prefs = context.getSharedPreferences("raund_widgets", 0)

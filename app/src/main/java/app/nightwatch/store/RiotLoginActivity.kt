@@ -103,7 +103,9 @@ class RiotLoginActivity : ComponentActivity() {
         }
         ViewCompat.requestApplyInsets(root)
         CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
+        // Riot's first-party authorization and redirect flow does not require cross-site cookie
+        // tracking. Social sign-in is intentionally handled outside this embedded flow.
+        CookieManager.getInstance().setAcceptThirdPartyCookies(web, false)
         web.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView?, value: Int) {
                 loading.progress = value
@@ -132,7 +134,7 @@ class RiotLoginActivity : ComponentActivity() {
                 }
                 val allowed = target.scheme == "https" && (name == "riotgames.com" || name.endsWith(".riotgames.com") || name == "playvalorant.com" || name.endsWith(".playvalorant.com"))
                 if(!allowed) {
-                    if(target.scheme == "https") runCatching { startActivity(Intent(Intent.ACTION_VIEW, target)) }
+                    openExternal(target)
                     return true
                 }
                 return false
@@ -151,6 +153,11 @@ class RiotLoginActivity : ComponentActivity() {
             }
             override fun onReceivedHttpError(view: WebView?, request: WebResourceRequest?, response: WebResourceResponse?) {
                 if(request?.isForMainFrame == true && (response?.statusCode ?: 0) >= 500) error.visibility = View.VISIBLE
+            }
+            override fun onReceivedSslError(view: WebView?, handler: android.webkit.SslErrorHandler?, sslError: android.net.http.SslError?) {
+                // Never allow a user to continue through a certificate failure on an account page.
+                handler?.cancel()
+                error.visibility = View.VISIBLE
             }
             override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
                 rendererAvailable = false
@@ -177,6 +184,8 @@ class RiotLoginActivity : ComponentActivity() {
         if(::web.isInitialized && rendererAvailable) {
             (web.parent as? android.view.ViewGroup)?.removeView(web)
             web.stopLoading()
+            web.clearHistory()
+            web.clearCache(true)
             web.destroy()
         }
         super.onDestroy()
@@ -189,7 +198,7 @@ class RiotLoginActivity : ComponentActivity() {
                 "Google, uygulama içindeki web penceresinden girişe izin vermiyor. Tarayıcıda açılan giriş de bu oturuma geri dönemez. Riot hesabında kullanıcı adı ve parola varsa bunlarla giriş yapabilirsin. Yoksa Riot hesap yönetiminden hesabını kontrol et; bu işlem hesabını uygulamadan çıkarmaz."
                 else "Google does not allow sign-in inside an embedded web window. Opening it in a browser cannot return to this session. If your Riot account has a username and password, use those here. Otherwise, check your account at Riot Account Management. This does not sign you out of the app.")
             .setPositiveButton(if(tr) "Riot hesap yönetimi" else "Riot Account Management") { _, _ ->
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://account.riotgames.com/")))
+                openExternal(Uri.parse("https://account.riotgames.com/"))
             }
             .setNegativeButton(if(tr) "Geri dön" else "Back", null)
             .show()
@@ -202,9 +211,14 @@ class RiotLoginActivity : ComponentActivity() {
                 else "If two-factor authentication is enabled, complete the email code or Riot Mobile approval requested on this Riot page. Check spam if the code does not arrive. Google sign-in is not supported in this embedded window.")
             .setPositiveButton(if(tr) "Tamam" else "OK", null)
             .setNeutralButton(if(tr) "Riot MFA yardımı" else "Riot MFA help") { _, _ ->
-                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://support.riotgames.com/en-us/riot/account/multi-factor-authentication-how-to-faq")))
+                openExternal(Uri.parse("https://support.riotgames.com/en-us/riot/account/multi-factor-authentication-how-to-faq"))
             }
             .show()
+    }
+    /** Devices without a browser must not crash the sign-in screen. */
+    private fun openExternal(target: Uri) {
+        if(target.scheme != "https") return
+        runCatching { startActivity(Intent(Intent.ACTION_VIEW, target).addCategory(Intent.CATEGORY_BROWSABLE)) }
     }
     companion object {
         const val LOCALE = "locale"

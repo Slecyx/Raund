@@ -21,6 +21,8 @@ import javax.crypto.spec.GCMParameterSpec
 
 class LoginRequired : Exception("Riot session expired")
 
+data class SavedAccountSlot(val id: String, val name: String, val region: String, val active: Boolean = false)
+
 class SessionStore(context: Context, preferencesName: String = "nightwatch_secure") {
     private val preferences = context.getSharedPreferences(preferencesName, Context.MODE_PRIVATE)
     private val key: SecretKey get() = synchronized(SessionStore::class.java) {
@@ -42,7 +44,12 @@ class SessionStore(context: Context, preferencesName: String = "nightwatch_secur
         String(cipher.doFinal(bytes.copyOfRange(12, bytes.size)), Charsets.UTF_8)
     }.getOrNull()
     fun session(): RiotSession? = get("session")?.let { runCatching { Gson().fromJson(it, RiotSession::class.java) }.getOrNull() }
-    fun save(session: RiotSession) { put("session", Gson().toJson(session)) }
+    fun save(session: RiotSession) {
+        val raw = Gson().toJson(session)
+        put("session", raw)
+        // Keep the active multi-account slot in sync after silent token refreshes.
+        get("active_slot")?.takeIf { it.isNotBlank() }?.let { put("slot_session_$it", raw) }
+    }
     fun cached(): LiveStoreAccount? = get("account")?.let { raw ->
         runCatching {
             val envelope = JSONObject(raw)
@@ -51,7 +58,56 @@ class SessionStore(context: Context, preferencesName: String = "nightwatch_secur
             }
         }.getOrNull()
     }
-    fun cache(account: LiveStoreAccount) { put("account", JSONObject().put("schema", 1).put("data", JSONObject(Gson().toJson(account))).toString()) }
+    fun cache(account: LiveStoreAccount) {
+        val raw = JSONObject().put("schema", 1).put("data", JSONObject(Gson().toJson(account))).toString()
+        put("account", raw)
+        val slotId = account.accountId?.takeIf { it.isNotBlank() } ?: return
+        put("active_slot", slotId)
+        put("slot_account_$slotId", raw)
+        session()?.let { put("slot_session_$slotId", Gson().toJson(it)) }
+        val existing = readSlots().filterNot { it.id == slotId }
+        val updated = (listOf(SavedAccountSlot(slotId, account.name, account.region, true)) + existing.map { it.copy(active = false) }).take(5)
+        put("account_slots", Gson().toJson(updated))
+    }
+
+    private fun readSlots(): List<SavedAccountSlot> = get("account_slots")?.let { raw ->
+        runCatching { Gson().fromJson(raw, Array<SavedAccountSlot>::class.java).toList() }.getOrNull()
+    }.orEmpty()
+
+    fun accounts(): List<SavedAccountSlot> {
+        val activeId = get("active_slot") ?: cached()?.accountId
+        val slots = readSlots()
+        if(slots.isEmpty()) {
+            val current = cached() ?: return emptyList()
+            val id = current.accountId?.takeIf { it.isNotBlank() } ?: return emptyList()
+            return listOf(SavedAccountSlot(id, current.name, current.region, true))
+        }
+        return slots.map { it.copy(active = it.id == activeId) }
+    }
+
+    fun switchAccount(id: String): Boolean {
+        val slotSession = get("slot_session_$id") ?: return false
+        val slotAccount = get("slot_account_$id")
+        put("session", slotSession)
+        if(slotAccount != null) put("account", slotAccount) else preferences.edit().remove("account").commit()
+        put("active_slot", id)
+        val updated = readSlots().map { it.copy(active = it.id == id) }
+        if(updated.isNotEmpty()) put("account_slots", Gson().toJson(updated))
+        return true
+    }
+
+    fun removeAccount(id: String) {
+        val wasActive = (get("active_slot") ?: cached()?.accountId) == id
+        preferences.edit().remove("slot_session_$id").remove("slot_account_$id").commit()
+        val remaining = readSlots().filterNot { it.id == id }
+        if(remaining.isEmpty()) {
+            clear()
+            return
+        }
+        put("account_slots", Gson().toJson(remaining))
+        if(wasActive) switchAccount(remaining.first().id)
+    }
+
     fun clear() { preferences.edit().clear().commit() }
 
     suspend fun validSession(forceRefresh: Boolean = false): RiotSession = withContext(Dispatchers.IO) {

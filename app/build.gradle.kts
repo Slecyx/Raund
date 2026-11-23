@@ -6,10 +6,20 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
+// Release signing secrets come from an untracked keystore.properties file or, preferably on CI,
+// from environment variables. Nothing secret is ever committed to the repository.
 val releaseSigning = Properties().apply {
     val file = rootProject.file("keystore.properties")
     if (file.exists()) file.inputStream().use { load(it) }
+    mapOf(
+        "storeFile" to "RAUND_STORE_FILE",
+        "storePassword" to "RAUND_STORE_PASSWORD",
+        "keyAlias" to "RAUND_KEY_ALIAS",
+        "keyPassword" to "RAUND_KEY_PASSWORD"
+    ).forEach { (key, env) -> System.getenv(env)?.takeIf { it.isNotBlank() }?.let { setProperty(key, it) } }
 }
+val hasReleaseSigning = listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+    .all { !releaseSigning.getProperty(it).isNullOrBlank() }
 
 android {
     namespace = "app.nightwatch.store"
@@ -28,12 +38,14 @@ android {
 
     signingConfigs {
         create("release") {
-            if (releaseSigning.isNotEmpty()) {
+            if (hasReleaseSigning) {
                 storeFile = rootProject.file(releaseSigning.getProperty("storeFile"))
                 storePassword = releaseSigning.getProperty("storePassword")
                 keyAlias = releaseSigning.getProperty("keyAlias")
                 keyPassword = releaseSigning.getProperty("keyPassword")
-                enableV1Signing = true
+                // minSdk 26 always verifies APK Signature Scheme v2+, so the legacy JAR (v1)
+                // scheme only adds attack surface without improving compatibility.
+                enableV1Signing = false
                 enableV2Signing = true
                 enableV3Signing = true
                 enableV4Signing = true
@@ -44,10 +56,12 @@ android {
     buildTypes {
         getByName("release") {
             isDebuggable = false
-            // R8 has an unresolved high-memory regression on this source set; release builds
-            // stay non-minified until it can be verified in CI without exhausting memory.
-            isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // Without secrets (e.g. pull-request CI) an unsigned release APK is produced instead
+            // of failing the build with a half-configured signing config.
+            if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")
         }
     }
 

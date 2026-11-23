@@ -17,8 +17,10 @@ Do not post suspected credential, token, account, or remote-execution issues in 
 
 - Cleartext HTTP is disabled.
 - Android backups/device transfer are disabled for all app data.
-- Login runs in a non-exported activity with screen capture disabled.
-- Session data uses Android Keystore-backed AES-GCM encryption.
-- Release builds are compiled with the Android release configuration. R8 shrinking remains disabled until it can be verified within the project’s memory budget.
+- Login runs in a non-exported activity with screen capture disabled (`FLAG_SECURE`) and third-party cookies disabled.
+- Session data (including multi-account slots) uses Android Keystore-backed AES-GCM encryption.
+- Authenticated requests validate Riot UUIDs and shard allow-lists, disable automatic redirects, and bound response reads.
+- Release builds are compiled with R8 code shrinking, resource shrinking, and `app/proguard-rules.pro`, using APK Signature Scheme v2/v3/v4 (v1 disabled for `minSdk 26`).
+- Release signing secrets can be supplied via untracked `keystore.properties` or CI environment variables (`RAUND_STORE_*`).
 
 These controls reduce risk but do not turn the current undocumented Riot/store flow into an approved production integration.

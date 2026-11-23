@@ -236,13 +236,27 @@ internal class EsportsRepository(private val context: Context) {
         if(!force && saved != null && age < maxAge)
             return@withContext saved.copy(match = EsportsCachePolicy.merge(saved.match, match))
         // Build the URL from the numeric ID, never from arbitrary page content.
+        require(Regex("^[0-9]{1,12}$").matches(match.id)) { "Invalid match ID" }
         val html = Jsoup.connect("https://www.vlr.gg/${match.id}")
             .userAgent("Raund/0.11 Android companion").timeout(12_000).maxBodySize(1_500_000).get().outerHtml()
         EsportsParser.detail(match, html).also {
             EsportsMemory.details[match.id] = it
             val raw = gson.toJson(it)
             EsportsMemory.detailRaw[match.id] = raw
-            detailCache.edit().putString(match.id, raw).putLong("${match.id}_at", System.currentTimeMillis()).apply()
+            detailCache.edit().apply {
+                putString(match.id, raw)
+                putLong("${match.id}_at", System.currentTimeMillis())
+                // Bound cached match details so SharedPreferences does not grow indefinitely.
+                detailCache.all.entries
+                    .filter { it.key.endsWith("_at") && it.value is Long }
+                    .sortedByDescending { it.value as Long }
+                    .drop(80)
+                    .forEach { (atKey, _) ->
+                        val id = atKey.removeSuffix("_at")
+                        remove(atKey); remove(id)
+                        EsportsMemory.details.remove(id); EsportsMemory.detailRaw.remove(id)
+                    }
+            }.apply()
         }
     }
 

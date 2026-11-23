@@ -7,6 +7,7 @@ import kotlin.math.abs
 
 internal data class StoreObservation(val expiresAt: Long, val observedAt: Long, val offers: List<StoreOffer>)
 internal data class StoreChange(val arrived: List<StoreOffer>, val left: List<StoreOffer>)
+internal data class RadarStats(val rotations: Int, val uniqueSkins: Int, val topWeapon: String?, val topWeaponCount: Int)
 
 internal object RadarHistory {
     fun accountKey(name: String, region: String): String = MessageDigest.getInstance("SHA-256")
@@ -40,6 +41,15 @@ internal object RadarHistory {
         return (active.offers + if(active.nightMarketAvailable) active.nightOffers else emptyList())
             .filter { it.id in ids && it.currency == "VP" && it.priceVp >= 0 }
             .groupBy { it.id }.values.map { offers -> offers.minBy { it.priceVp } }.sortedBy { it.priceVp }
+    }
+
+    fun summary(history: List<StoreObservation>): RadarStats {
+        val allOffers = history.flatMap { it.offers }
+        val unique = allOffers.map { it.id }.toSet().size
+        val top = allOffers.filter { it.skinOffer() }
+            .groupingBy { it.weaponLabel() }.eachCount()
+            .maxByOrNull { it.value }
+        return RadarStats(history.size, unique, top?.key, top?.value ?: 0)
     }
 }
 

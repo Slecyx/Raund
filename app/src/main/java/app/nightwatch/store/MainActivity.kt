@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.grid.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
@@ -35,9 +36,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
@@ -58,12 +56,6 @@ import java.util.Locale
 import com.google.gson.Gson
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
-import androidx.media3.common.PlaybackException
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.PlayerView
 
 class MainActivity : ComponentActivity() {
     private var navigationRequest by mutableStateOf(0 to Page.STORE)
@@ -105,6 +97,7 @@ private fun NightwatchApp(requestedPage: Pair<Int, Page>, requestedMatch: Pair<I
     val secure = remember { SessionStore(context) }
     val scope = rememberCoroutineScope()
     var account by remember { mutableStateOf<LiveStoreAccount?>(null) }
+    var savedAccounts by remember { mutableStateOf<List<SavedAccountSlot>>(emptyList()) }
     var resolvedOwned by remember { mutableStateOf<Set<String>>(emptySet()) }
     LaunchedEffect(account?.accountId, account?.inventory?.checkedAt) {
         val levels = account?.inventory?.skinLevelIds.orEmpty()
@@ -117,20 +110,7 @@ private fun NightwatchApp(requestedPage: Pair<Int, Page>, requestedMatch: Pair<I
     var matchRoute by remember { mutableStateOf<Pair<Int, EsportsMatch?>>(0 to null) }
     LaunchedEffect(requestedMatch) { matchRoute = requestedMatch }
     LaunchedEffect(requestedPage) { if(requestedPage.first > 0 || requestedPage.second != Page.STORE) page = requestedPage.second }
-    // The navigation is a primary control, especially on phones.  Hiding it after a
-    // small scroll was easy to trigger accidentally and made the app feel broken.
-    var navVisible by remember(page) { mutableStateOf(true) }
     var esportsSubpage by remember { mutableStateOf(false) }
-    val navScroll = remember(page) { object : NestedScrollConnection {
-        var travel = 0f
-        override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-            if(source == NestedScrollSource.UserInput) {
-                travel = (travel + consumed.y).coerceIn(-100f, 100f)
-                navVisible = true
-            }
-            return Offset.Zero
-        }
-    } }
     var language by rememberSaveable { mutableStateOf(prefs.getString("language", null) ?: if(Locale.getDefault().language == "tr") "TR" else "EN") }
     var themeMode by rememberSaveable { mutableStateOf(prefs.getString("theme", "system").orEmpty()) }
     var onboarding by rememberSaveable { mutableStateOf(!prefs.getBoolean("onboarding_complete", false)) }
@@ -147,6 +127,8 @@ private fun NightwatchApp(requestedPage: Pair<Int, Page>, requestedMatch: Pair<I
     var bundle by remember { mutableStateOf<StoreBundle?>(null) }
     var radar by remember { mutableStateOf(false) }
     var inventoryOpen by remember { mutableStateOf(false) }
+    var loadoutOpen by remember { mutableStateOf(false) }
+    var gameHubOpen by remember { mutableStateOf(false) }
     var match by remember { mutableStateOf<MatchSummary?>(null) }
     var catalog by remember { mutableStateOf<List<StoreOffer>>(emptyList()) }
     var catalogError by remember { mutableStateOf(false) }
@@ -253,6 +235,7 @@ private fun NightwatchApp(requestedPage: Pair<Int, Page>, requestedMatch: Pair<I
                 })
                 withContext(Dispatchers.IO) { secure.cache(result); RadarRepository(context).record(result) }
                 account = result
+                savedAccounts = withContext(Dispatchers.IO) { secure.accounts() }
                 prefs.edit().putBoolean("connected", true).putBoolean("background_login_required", false).apply()
                 FavoriteAlerts.schedule(context, notifications && prefs.getBoolean("notify_store", true))
                 WidgetRefreshScheduler.schedule(context)
@@ -276,6 +259,7 @@ private fun NightwatchApp(requestedPage: Pair<Int, Page>, requestedMatch: Pair<I
             }
         }
         account = withContext(Dispatchers.IO) { secure.cached() }
+        savedAccounts = withContext(Dispatchers.IO) { secure.accounts() }
         restoring = false
         val cachedAccount = account
         val now = System.currentTimeMillis()
@@ -335,26 +319,70 @@ private fun NightwatchApp(requestedPage: Pair<Int, Page>, requestedMatch: Pair<I
                 Row(Modifier.fillMaxSize().then(if(widthClass == RaundWidthClass.COMPACT) Modifier else Modifier.navigationBarsPadding())) {
                     if(widthClass != RaundWidthClass.COMPACT) AdaptiveNavigationRail(page) { page = it }
                     Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.TopCenter) {
-                    Column(Modifier.fillMaxHeight().widthIn(max = contentMaxWidth).fillMaxWidth().nestedScroll(navScroll)) {
+                    Column(Modifier.fillMaxHeight().widthIn(max = contentMaxWidth).fillMaxWidth()) {
                     Box(Modifier.weight(1f)) {
                     pageStateHolder.SaveableStateProvider(page.name) {
                         val destination = page
                         when(destination) {
-                            Page.STORE -> StorePage(visibleAccount, loading || restoring, error, needsLogin, { if(needsLogin || account == null) login = true else refresh() }, { refresh() }, wished, ::toggle, { selected = it }, { bundle = it }, { inventoryOpen = true })
-                            Page.CAREER -> CareerPage(account?.career, account?.progress, loading, agents, maps, seasons, { match = it }, { if(account == null) login = true else refresh() }, { historyLimit += 20; refresh(limit = historyLimit) })
+                            Page.STORE -> StorePage(visibleAccount, savedAccounts, { slotId ->
+                                scope.launch {
+                                    job?.cancelAndJoin(); job = null
+                                    if(withContext(Dispatchers.IO) { secure.switchAccount(slotId) }) {
+                                        account = withContext(Dispatchers.IO) { secure.cached() }
+                                        savedAccounts = withContext(Dispatchers.IO) { secure.accounts() }
+                                        needsLogin = false; error = null
+                                        RaundWidgetProvider.updateAll(context)
+                                        refresh()
+                                    }
+                                }
+                            }, loading || restoring, error, needsLogin, { if(needsLogin || account == null) login = true else refresh() }, { refresh() }, wished, ::toggle, { selected = it }, { bundle = it }, { inventoryOpen = true })
+                            Page.CAREER -> CareerPage(account?.career, account?.progress, loading, agents, maps, seasons, { match = it }, { if(account == null) login = true else refresh() }, { historyLimit += 20; refresh(limit = historyLimit) }, { gameHubOpen = true })
                             Page.ESPORTS -> EsportsPage(esportsTeams, ::toggleTeam, esportsPlayers, ::togglePlayer, trackedMatch, { trackedMatch = it }, matchAlerts, { page = Page.SETTINGS }, { esportsSubpage = it }, matchRoute, { matchRoute = matchRoute.first to null })
                             Page.FAVORITES -> FavoritesPage(catalog + savedItems, wished, catalogLoading, catalogError, notifications, visibleAccount?.snapshot,
                                 resolvedOwned, ::toggle, { selected = it; selectedOwned = it.id in resolvedOwned }, ::loadCatalog, ::requestAlerts, { radar = true })
-                            Page.SETTINGS -> SettingsPage(account, themeMode, { themeMode = it; prefs.edit().putString("theme", it).apply(); RaundWidgetProvider.updateAll(context) }, language, notifications, { language = it; prefs.edit().putString("language", it).apply(); RaundWidgetProvider.updateAll(context) }, ::requestAlerts,
+                            Page.SETTINGS -> SettingsPage(account, savedAccounts, themeMode, { themeMode = it; prefs.edit().putString("theme", it).apply(); RaundWidgetProvider.updateAll(context) }, language, notifications, { language = it; prefs.edit().putString("language", it).apply(); RaundWidgetProvider.updateAll(context) }, ::requestAlerts,
                                 esportsMode, ::requestEsportsMode, esportsTeams, matchAlerts, ::setMatchAlerts,
-                                { login = true }, { onboarding = true }, {
+                                { login = true },
+                                {
+                                    // Clear WebView cookies so a second Riot account can sign in without auto-reusing the first.
+                                    CookieManager.getInstance().removeAllCookies { CookieManager.getInstance().flush() }
+                                    login = true
+                                },
+                                { slotId ->
+                                    scope.launch {
+                                        job?.cancelAndJoin(); job = null
+                                        val switched = withContext(Dispatchers.IO) { secure.switchAccount(slotId) }
+                                        if(switched) {
+                                            account = withContext(Dispatchers.IO) { secure.cached() }
+                                            savedAccounts = withContext(Dispatchers.IO) { secure.accounts() }
+                                            needsLogin = false; error = null
+                                            RaundWidgetProvider.updateAll(context)
+                                            refresh()
+                                        }
+                                    }
+                                },
+                                { slotId ->
+                                    scope.launch {
+                                        job?.cancelAndJoin(); job = null
+                                        withContext(Dispatchers.IO) { secure.removeAccount(slotId) }
+                                        account = withContext(Dispatchers.IO) { secure.cached() }
+                                        savedAccounts = withContext(Dispatchers.IO) { secure.accounts() }
+                                        if(account == null) prefs.edit().putBoolean("connected", false).apply()
+                                        RaundWidgetProvider.updateAll(context)
+                                    }
+                                },
+                                { onboarding = true }, {
                                     scope.launch {
                                         job?.cancelAndJoin(); job = null
                                         withContext(Dispatchers.IO) { secure.clear() }
-                                        account = null; needsLogin = false; error = null
-                                        prefs.edit().putBoolean("connected", false).apply()
+                                        account = null; savedAccounts = emptyList(); needsLogin = false; error = null
+                                        prefs.edit().putBoolean("connected", false).putBoolean("background_login_required", false).apply()
                                         CookieManager.getInstance().removeAllCookies { CookieManager.getInstance().flush() }
-                                        WebStorage.getInstance().deleteAllData(); FavoriteAlerts.schedule(context, false)
+                                        WebStorage.getInstance().deleteAllData()
+                                        FavoriteAlerts.schedule(context, false)
+                                        WidgetRefreshScheduler.schedule(context)
+                                        context.getSystemService(android.app.NotificationManager::class.java).cancel(71)
+                                        RaundWidgetProvider.updateAll(context)
                                     }
                                 })
                         }
@@ -372,7 +400,9 @@ private fun NightwatchApp(requestedPage: Pair<Int, Page>, requestedMatch: Pair<I
                     if(value.items.isEmpty()) Note(txt("Riot did not return the bundle contents.", "Riot paket içeriğini döndürmedi."))
                 } }
                 if(radar) RadarPage(visibleAccount, catalog + savedItems, wished, { selected = it }) { radar = false }
-                if(inventoryOpen) InventoryPage(account, loading, { refresh() }, { offer, owned -> selected = offer; selectedOwned = owned }) { inventoryOpen = false }
+                if(inventoryOpen) InventoryPage(account, loading, { refresh() }, { offer, owned -> selected = offer; selectedOwned = owned }, onLoadout = { loadoutOpen = true }) { inventoryOpen = false }
+                if(loadoutOpen) LoadoutScreen { loadoutOpen = false }
+                if(gameHubOpen) GameHubScreen(account) { gameHubOpen = false }
                 match?.let { MatchDetailPage(it, agents, maps, account?.career?.matches.orEmpty()) { match = null } }
                 selected?.let { offer -> SkinDetailPage(offer, offer.id in wished, selectedOwned, { toggle(offer.id) }, {
                     comparisonBase = offer; selected = null; selectedOwned = false
@@ -620,18 +650,33 @@ private fun NightwatchApp(requestedPage: Pair<Int, Page>, requestedMatch: Pair<I
     }
     HorizontalDivider(color = Raised.copy(alpha = .6f))
 }
-@Composable private fun StorePage(account: LiveStoreAccount?, loading: Boolean, error: String?, needsLogin: Boolean, onConnect: () -> Unit, onRefresh: () -> Unit, wished: List<String>, onWish: (String) -> Unit, onOpen: (StoreOffer) -> Unit, onBundle: (StoreBundle) -> Unit, onInventory: () -> Unit) {
-    LazyColumn(contentPadding = PaddingValues(horizontal = 20.dp, vertical = 4.dp)) {
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun StorePage(account: LiveStoreAccount?, savedAccounts: List<SavedAccountSlot>, onSwitchAccount: (String) -> Unit, loading: Boolean, error: String?, needsLogin: Boolean, onConnect: () -> Unit, onRefresh: () -> Unit, wished: List<String>, onWish: (String) -> Unit, onOpen: (StoreOffer) -> Unit, onBundle: (StoreBundle) -> Unit, onInventory: () -> Unit) {
+    val context = LocalContext.current
+    val tr = LocalTurkish.current
+    PullToRefreshBox(isRefreshing = loading, onRefresh = onRefresh, modifier = Modifier.fillMaxSize()) {
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 4.dp)) {
         item {
             Header(txt("Store","Mağaza"), if(account != null) txt("Your daily rotation","Sana özel günlük seçki") else "Raund", if(loading) null else txt("Refresh","Yenile"), onRefresh)
+            if(savedAccounts.size > 1) {
+                LazyRow(Modifier.fillMaxWidth().padding(bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(savedAccounts, key = { it.id }) { slot ->
+                        Chip(slot.name.substringBefore('#'), slot.active) { if(!slot.active) onSwitchAccount(slot.id) }
+                    }
+                }
+            }
             if(loading) { LinearProgressIndicator(Modifier.fillMaxWidth(), color = Accent, trackColor = Raised); Note(txt("Updating your account…", "Hesabın güncelleniyor…")) }
             error?.let { Note(it); TextButton(onClick = onConnect) { Text(if(needsLogin) txt("Renew session","Oturumu yenile") else txt("Retry","Tekrar dene")) } }
             if(account == null && !loading) Empty(txt("Your store, always close.","Mağazan her an yanında."), txt("Link your Riot account to see your offers.","Tekliflerini görmek için Riot hesabını bağla."), txt("Continue with Riot","Riot ile devam et"), onConnect)
             if(account != null) {
                 StoreAccountHero(account)
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
                     account.snapshot.balances.forEach { (currency, amount) -> Text("$amount $currency", color = White, fontSize = 11.sp,
                         modifier = Modifier.padding(vertical = 7.dp)) }
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = { ShareSummaries.shareText(context, if(tr) "Günlük Mağaza" else "Daily Store", ShareSummaries.storeSummary(account, tr)) }) {
+                        Text(txt("Share ↗", "Paylaş ↗"), fontSize = 11.sp)
+                    }
                 }
                 Row(Modifier.fillMaxWidth().clickable(onClick = onInventory).padding(vertical = 13.dp), verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
@@ -670,14 +715,21 @@ private fun NightwatchApp(requestedPage: Pair<Int, Page>, requestedMatch: Pair<I
             }
         }
     }
+    }
 }
 @Composable private fun countdown(epoch: Long): String {
+    val tr = LocalTurkish.current
     var now by remember { mutableLongStateOf(System.currentTimeMillis()/1000) }
     LaunchedEffect(epoch) { while(true) { delay(1000); now = System.currentTimeMillis()/1000 } }
     val left = (epoch-now).coerceAtLeast(0)
-    return if(left > 86400) "${left/86400}d ${left/3600%24}h" else String.format(Locale.ROOT, "%02d:%02d:%02d", left/3600, left/60%60, left%60)
+    return if(left > 86400) if(tr) "${left/86400}g ${left/3600%24}sa" else "${left/86400}d ${left/3600%24}h"
+        else String.format(Locale.ROOT, "%02d:%02d:%02d", left/3600, left/60%60, left%60)
 }
-internal fun timeLabel(epoch: Long) = runCatching { DateTimeFormatter.ofPattern("dd MMM · HH:mm", Locale.getDefault()).format(Instant.ofEpochMilli(epoch).atZone(ZoneId.systemDefault())) }.getOrDefault("")
+internal fun formatTimeLabel(epoch: Long, turkish: Boolean): String = runCatching {
+    DateTimeFormatter.ofPattern("dd MMM · HH:mm", if(turkish) Locale.forLanguageTag("tr") else Locale.ENGLISH)
+        .format(Instant.ofEpochMilli(epoch).atZone(ZoneId.systemDefault()))
+}.getOrDefault("")
+@Composable internal fun timeLabel(epoch: Long): String = formatTimeLabel(epoch, LocalTurkish.current)
 
 internal fun normalized(value: String): String = Normalizer.normalize(value.lowercase(Locale.ROOT).replace('ı','i'), Normalizer.Form.NFD).replace(Regex("\\p{M}+"), "")
 @Composable private fun FavoritesPage(catalog: List<StoreOffer>, wished: List<String>, loading: Boolean, failed: Boolean, notifications: Boolean, snapshot: StoreSnapshot?, ownedIds: Set<String>, onWish: (String) -> Unit, onOpen: (StoreOffer) -> Unit, onRetry: () -> Unit, onAlerts: (Boolean) -> Unit, onRadar: () -> Unit) {
@@ -690,16 +742,28 @@ internal fun normalized(value: String): String = Normalizer.normalize(value.lowe
     var search by rememberSaveable { mutableStateOf("") }
     var browse by rememberSaveable { mutableStateOf(false) }
     var weapon by rememberSaveable { mutableStateOf<String?>(null) }
+    var hideOwned by rememberSaveable { mutableStateOf(false) }
+    var videoOnly by rememberSaveable { mutableStateOf(false) }
+    var sortMode by rememberSaveable { mutableStateOf("default") }
     val all = remember(catalog, snapshot, wished.toList()) {
         val resolved = (snapshot?.offers.orEmpty() + snapshot?.nightOffers.orEmpty() + snapshot?.accessories.orEmpty() +
             snapshot?.bundles.orEmpty().flatMap { it.items } + catalog).filter { it.skinOffer() || it.id in wished }.distinctBy { it.id }
         resolved + wished.filter { id -> resolved.none { it.id == id } }.map(PendingCatalog::skin)
     }
     val available = snapshot?.let { FavoriteAlerts.matches(it, wished.toSet()).map { offer -> offer.id }.toSet() }.orEmpty()
-    val rows = remember(all, wished.toList(), search, browse, weapon, localizedNames) {
-        all.filter { (if(browse) it.skinOffer() else it.id in wished) && (weapon == null || it.weaponLabel() == weapon) &&
-            (normalized(it.name).contains(normalized(search)) || normalized(localizedNames[it.id].orEmpty()).contains(normalized(search))) }
-            .map { offer -> localizedNames[offer.id]?.let { offer.copy(name = it) } ?: offer }
+    val rows = remember(all, wished.toList(), search, browse, weapon, hideOwned, videoOnly, sortMode, localizedNames, ownedIds, available) {
+        val filtered = all.filter {
+            (if(browse) it.skinOffer() else it.id in wished) &&
+                (weapon == null || it.weaponLabel() == weapon) &&
+                (!hideOwned || it.id !in ownedIds) &&
+                (!videoOnly || it.variants.any { variant -> !variant.video.isNullOrBlank() }) &&
+                (normalized(it.name).contains(normalized(search)) || normalized(localizedNames[it.id].orEmpty()).contains(normalized(search)))
+        }.map { offer -> localizedNames[offer.id]?.let { offer.copy(name = it) } ?: offer }
+        when(sortMode) {
+            "name" -> filtered.sortedWith(compareByDescending<StoreOffer> { it.id in available }.thenBy { it.name.lowercase(Locale.ROOT) })
+            "weapon" -> filtered.sortedWith(compareByDescending<StoreOffer> { it.id in available }.thenBy { it.weaponLabel() }.thenBy { it.name.lowercase(Locale.ROOT) })
+            else -> filtered.sortedByDescending { it.id in available }
+        }
     }
     val gridColumns = when(LocalRaundWidthClass.current) {
         RaundWidthClass.COMPACT -> 2
@@ -725,6 +789,19 @@ internal fun normalized(value: String): String = Normalizer.normalize(value.lowe
                     val types = all.filter { it.skinOffer() }.map { it.weaponLabel() }.distinct().sorted()
                     items(types, key = { it }) { type -> Chip(type, weapon == type) { weapon = type } }
                 }
+                LazyRow(Modifier.fillMaxWidth().padding(bottom = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    item { Chip(txt("Hide owned", "Sahip olduklarımı gizle"), hideOwned) { hideOwned = !hideOwned } }
+                    item { Chip(txt("With video", "Videolu"), videoOnly) { videoOnly = !videoOnly } }
+                    item {
+                        val nextSort = when(sortMode) { "default" -> "name"; "name" -> "weapon"; else -> "default" }
+                        val label = when(sortMode) {
+                            "name" -> txt("Sort: A–Z", "Sırala: A–Z")
+                            "weapon" -> txt("Sort: Weapon", "Sırala: Silah")
+                            else -> txt("Sort: Default", "Sırala: Varsayılan")
+                        }
+                        Chip(label, sortMode != "default") { sortMode = nextSort }
+                    }
+                }
                 Text("${rows.size} " + txt("skins", "skin") + " · " + txt("swipe for weapons","silahlar için sağa kaydır"), color = Muted, fontSize = 11.sp,
                     modifier = Modifier.padding(bottom = 7.dp))
                 if(!browse) {
@@ -749,14 +826,15 @@ internal fun normalized(value: String): String = Normalizer.normalize(value.lowe
                 }
             }
         }
-        items(rows.sortedByDescending { it.id in available }, key = { it.id }) { offer ->
+        items(rows, key = { it.id }) { offer ->
             SkinCard(offer, offer.id in wished, { onWish(offer.id) }, { onOpen(offer) }, available = offer.id in available,
                 showPrice = offer.priceVp >= 0, owned = offer.id in ownedIds)
         }
     }
 }
 
-@Composable internal fun CareerPage(career: CareerSummary?, progress: ProgressSummary?, loading: Boolean, agents: Map<String, JSONObject>, maps: Map<String, JSONObject>, seasons: List<SeasonWindow>, onMatch: (MatchSummary) -> Unit, onRefresh: () -> Unit, onMore: () -> Unit) {
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable internal fun CareerPage(career: CareerSummary?, progress: ProgressSummary?, loading: Boolean, agents: Map<String, JSONObject>, maps: Map<String, JSONObject>, seasons: List<SeasonWindow>, onMatch: (MatchSummary) -> Unit, onRefresh: () -> Unit, onMore: () -> Unit, onGameHub: () -> Unit = {}) {
     val context = LocalContext.current
     var rankIcon by remember(career?.rankTier) { mutableStateOf<String?>(null) }
     var rankIconLoaded by remember(rankIcon) { mutableStateOf(false) }
@@ -787,9 +865,18 @@ internal fun normalized(value: String): String = Normalizer.normalize(value.lowe
         (mode == "All" || it.mode == mode) && (mapFilter == null || it.map == mapFilter) &&
         (resultFilter == "all" || (resultFilter == "win" && it.won == true) || (resultFilter == "loss" && it.won == false))
     }
-    LazyColumn(contentPadding = PaddingValues(horizontal = 20.dp, vertical = 4.dp)) {
+    PullToRefreshBox(isRefreshing = loading, onRefresh = onRefresh, modifier = Modifier.fillMaxSize()) {
+    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 20.dp, vertical = 4.dp)) {
         item {
             Header(txt("Career","Kariyer"), txt("Match history and season progress.","Maç geçmişin ve sezon ilerlemen."), txt("Refresh","Yenile"), onRefresh)
+            Row(Modifier.fillMaxWidth().clickable(onClick = onGameHub).padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(txt("Game Hub & Player Lookup", "Oyun Merkezi ve Oyuncu Ara"), color = White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                    Text(txt("Server status, patch notes, weapons, agents & player rank lookup", "Sunucu durumu, yama notları, silahlar, ajanlar ve oyuncu arama"), color = Muted, fontSize = 11.sp)
+                }
+                Text("→", color = Accent, fontSize = 18.sp)
+            }
+            HorizontalDivider(color = Raised.copy(alpha = .55f))
             if(loading) LinearProgressIndicator(Modifier.fillMaxWidth(), color = Accent)
             if(career == null && progress == null && !loading) Empty(txt("Career & season","Kariyer ve sezon"), txt("Connect your account to see matches, missions and progression.", "Maçlarını, görevlerini ve ilerlemeni görmek için hesabını bağla."), txt("Connect / refresh","Bağlan / yenile"), onRefresh)
             if(career == null && progress != null && !loading) Note(txt("Match history could not be loaded. Try refreshing.", "Maç geçmişi yüklenemedi. Yenilemeyi deneyebilirsin."))
@@ -877,13 +964,16 @@ internal fun normalized(value: String): String = Normalizer.normalize(value.lowe
                 seasonMatches.filter { it.mode.equals("Competitive", true) && it.detailsJson != null && it.agentId.isNotBlank() }.groupBy { it.agentId }.entries.sortedByDescending { it.value.size }.take(5).forEach { (id, games) ->
                     PerformanceRow(agents[id]?.textOrNull("displayName") ?: txt("Agent","Ajan"), agents[id]?.textOrNull("displayIcon"), games)
                 }
-                SectionTitle(txt("By map","Haritalara göre"))
+                SectionTitle(txt("By map","Haritalara göre"), txt("Tap for callouts", "Bölgeler için dokun"))
+                var selectedMapGuide by remember { mutableStateOf<String?>(null) }
+                selectedMapGuide?.let { mapName -> MapCalloutDialog(mapName, maps[mapName]) { selectedMapGuide = null } }
                 seasonMatches.filter { it.mode.equals("Competitive", true) && it.detailsJson != null }.groupBy { it.map }.entries.sortedByDescending { it.value.size }.forEach { (name, games) ->
-                    PerformanceRow(name, maps[name]?.textOrNull("listViewIcon"), games)
+                    PerformanceRow(name, maps[name]?.textOrNull("listViewIcon"), games, onClick = if(maps[name] != null) ({ selectedMapGuide = name }) else null)
                 }
                 Note(txt("Competitive matches loaded on this device only.", "Yalnızca bu cihazda yüklü rekabetçi maçlara dayanır."))
             }
         }
+    }
     }
 }
 
@@ -1057,10 +1147,10 @@ internal fun normalized(value: String): String = Normalizer.normalize(value.lowe
     }
 }
 
-@Composable private fun PerformanceRow(name: String, image: String?, games: List<MatchSummary>) {
+@Composable private fun PerformanceRow(name: String, image: String?, games: List<MatchSummary>, onClick: (() -> Unit)? = null) {
     val decided = games.count { it.won != null }
     val wins = games.count { it.won == true }
-    Row(Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().then(if(onClick != null) Modifier.clickable(onClick = onClick) else Modifier).padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
         AsyncImage(image, name, Modifier.size(38.dp).clip(RoundedCornerShape(10.dp)).background(Panel), contentScale = ContentScale.Crop)
         Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
             Text(name, color = White, fontSize = 14.sp)
@@ -1141,249 +1231,6 @@ internal fun normalized(value: String): String = Normalizer.normalize(value.lowe
     }
 }
 
-@Composable private fun SettingsPage(account: LiveStoreAccount?, themeMode: String, onTheme: (String) -> Unit, language: String, alerts: Boolean, onLanguage: (String) -> Unit, onAlerts: (Boolean) -> Unit,
-                                    esportsMode: String, onEsportsMode: (String) -> Unit, esportsTeams: Set<String>, matchAlerts: Boolean, onMatchAlerts: (Boolean) -> Unit,
-                                    onLogin: () -> Unit, onShowOnboarding: () -> Unit, onLogout: () -> Unit) {
-    val context = LocalContext.current
-    // These disclosures intentionally reset when the Settings destination is left.  Keeping
-    // them in the destination saveable state makes a return from another tab reopen an
-    // arbitrary section, which is visually surprising and hides the rest of the settings.
-    var deliveryOpen by remember { mutableStateOf(false) }
-    var trustOpen by remember { mutableStateOf(false) }
-    var appearanceOpen by remember { mutableStateOf(false) }
-    var alertsOpen by remember { mutableStateOf(false) }
-    val soundPrefs = remember { context.getSharedPreferences("nightwatch", Context.MODE_PRIVATE) }
-    var sounds by remember { mutableStateOf(soundPrefs.getBoolean("interaction_sounds", true)) }
-    var nowBar by remember { mutableStateOf(soundPrefs.getBoolean("now_bar", true)) }
-    var storeNotice by remember { mutableStateOf(soundPrefs.getBoolean("notify_store", true)) }
-    var reminderNotice by remember { mutableStateOf(soundPrefs.getBoolean("notify_esports_reminders", true)) }
-    var resultNotice by remember { mutableStateOf(soundPrefs.getBoolean("notify_esports_results", true)) }
-    var mapNotice by remember { mutableStateOf(soundPrefs.getBoolean("notify_esports_maps", true)) }
-    var liveNotice by remember { mutableStateOf(soundPrefs.getBoolean("notify_esports_live", true)) }
-    var batterySaver by remember { mutableStateOf(soundPrefs.getBoolean("battery_saver", true)) }
-    var notificationProfile by remember { mutableStateOf(soundPrefs.getString("esports_notification_profile", "custom") ?: "custom") }
-    var autoStore by remember { mutableStateOf(soundPrefs.getBoolean("auto_store_refresh", true)) }
-    var spoiler by remember { mutableStateOf(SpoilerPolicy.enabled(context)) }
-    var permissionRevision by remember { mutableIntStateOf(0) }
-    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event -> if(event == Lifecycle.Event.ON_RESUME) permissionRevision++ }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-    }
-    val appVersion = remember { runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull().orEmpty() }
-    val canPromote = remember(permissionRevision) { Build.VERSION.SDK_INT >= 36 && context.getSystemService(android.app.NotificationManager::class.java).canPostPromotedNotifications() }
-    val liveCapability = LiveUpdateCapability.state(Build.VERSION.SDK_INT, nowBar, ScoreNotifications.permitted(context), canPromote)
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp)) {
-        Header(txt("Settings","Ayarlar"), "Raund · $appVersion")
-        Row(Modifier.fillMaxWidth().padding(bottom = 5.dp), verticalAlignment = Alignment.CenterVertically) {
-            account?.playerCard?.small?.let { art ->
-                AsyncImage(art, txt("Player card", "Oyuncu kartı"), Modifier.padding(end = 14.dp).size(58.dp), contentScale = ContentScale.Fit)
-            }
-            Column(Modifier.weight(1f)) {
-                Text(account?.name ?: txt("Riot account","Riot hesabı"), color = White, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
-                Text(if(account != null) txt("Connected on this device", "Bu cihazda bağlı") else txt("Not connected", "Bağlı değil"),
-                    color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 3.dp))
-            }
-            TextButton(onClick = onLogin) { Text(if(account == null) txt("Connect","Bağlan") else txt("Renew","Yenile")) }
-        }
-        HorizontalDivider(color = Raised.copy(alpha = .7f))
-        SettingsDisclosure(txt("Appearance & language", "Görünüm ve dil"),
-            (if(themeMode == "light") txt("Light", "Açık") else if(themeMode == "dark") txt("Dark", "Koyu") else txt("System", "Sistem")) + " · " + if(language == "TR") "Türkçe" else "English", appearanceOpen) { appearanceOpen = !appearanceOpen }
-        if(appearanceOpen) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Chip(txt("System","Sistem"), themeMode == "system") { onTheme("system") }
-            Chip(txt("Light","Açık"), themeMode == "light") { onTheme("light") }
-            Chip(txt("Dark","Koyu"), themeMode == "dark") { onTheme("dark") }
-        }
-        SectionTitle(txt("Language","Dil"))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { Chip("Türkçe", language == "TR") { onLanguage("TR") }; Chip("English", language == "EN") { onLanguage("EN") } }
-        TextButton(onClick = onShowOnboarding, modifier = Modifier.padding(top = 6.dp)) { Text(txt("View welcome guide", "Karşılama rehberini göster")) }
-        }
-        HorizontalDivider(color = Raised.copy(alpha = .55f))
-        NotificationPreferenceRow(txt("Hide match scores", "Maç skorlarını gizle"),
-            txt("Shared by Esports, widgets and notifications · reveal per match", "Espor, widget ve bildirimlerde ortak · maç içinde açabilirsin"), spoiler) {
-            spoiler = it; SpoilerPolicy.change(context, it)
-        }
-        HorizontalDivider(color = Raised.copy(alpha = .55f))
-        Row(Modifier.fillMaxWidth().heightIn(min = 70.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(txt("Interaction sounds", "İşlem sesleri"), color = White, fontSize = 14.sp)
-                Text(txt("Tabs, filters and favorites · follows system sound", "Sekme, filtre ve favoriler · sistem sesine uyar"), color = Muted, fontSize = 11.sp)
-            }
-            Switch(sounds, onCheckedChange = { sounds = it; soundPrefs.edit().putBoolean("interaction_sounds", it).apply() })
-        }
-        HorizontalDivider(color = Raised.copy(alpha = .55f))
-        NotificationPreferenceRow(txt("Automatic store check", "Otomatik mağaza kontrolü"),
-            txt("Updates your store and widgets in the background · no extra alerts", "Mağaza ve widget’lar arka planda güncellenir · ek bildirim göndermez"), autoStore) {
-            autoStore = it; soundPrefs.edit().putBoolean("auto_store_refresh", it).apply()
-            WidgetRefreshScheduler.schedule(context)
-            if(it) WidgetRefreshScheduler.refresh(context)
-        }
-        Text(txt("Home screen: long-press → Widgets → Raund. Each widget has its own settings and can be resized.",
-            "Ana ekrana basılı tut → Widget’lar → Raund. Her widget ayrı ayarlanabilir ve boyutlandırılabilir."),
-            color = Muted, fontSize = 11.sp, modifier = Modifier.padding(bottom = 12.dp))
-        HorizontalDivider(color = Raised.copy(alpha = .55f))
-        SettingsDisclosure(txt("Notifications & live scores", "Bildirimler ve canlı skor"), txt("Skin alerts, matches and followed teams", "Skin uyarıları, maçlar ve takip edilen takımlar"), alertsOpen) { alertsOpen = !alertsOpen }
-        if(alertsOpen) {
-        Row(Modifier.fillMaxWidth().heightIn(min = 55.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(txt("Live updates / Samsung Now Bar", "Canlı güncellemeler / Samsung Now Bar"), color = White, fontSize = 14.sp)
-                Text(when(liveCapability) {
-                    "off" -> txt("Disabled", "Kapalı")
-                    "notifications" -> txt("Android notifications are disabled", "Android bildirimleri kapalı")
-                    "standard" -> txt("Standard ongoing notification · Android 16 Live Updates unavailable", "Standart sürekli bildirim · Android 16 Live Updates kullanılamıyor")
-                    "permission" -> txt("Live update permission required", "Canlı güncelleme izni gerekli")
-                    else -> txt("System-eligible; lock-screen placement depends on your phone", "Sistem için uygun; kilit ekranındaki görünüm telefona bağlı")
-                }, color = Muted, fontSize = 12.sp)
-            }
-            Switch(nowBar, onCheckedChange = { nowBar = it; soundPrefs.edit().putBoolean("now_bar", it).apply() })
-        }
-        if(Build.VERSION.SDK_INT >= 36 && nowBar && !canPromote) TextButton(onClick = {
-            runCatching { context.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_PROMOTION_SETTINGS)
-                .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)) }
-        }) { Text(txt("Allow live updates", "Canlı güncelleme izni ver")) }
-        Row(Modifier.fillMaxWidth().heightIn(min = 55.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(txt("Store & favorite alerts", "Mağaza ve favori uyarıları"), color = White, fontSize = 14.sp)
-                Text(txt("Twice daily · around 03:00 and 09:00", "Günde iki kez · yaklaşık 03.00 ve 09.00"), color = Muted, fontSize = 11.sp)
-            }
-            Switch(alerts, onCheckedChange = onAlerts)
-        }
-        if(alerts) NotificationPreferenceRow(txt("Daily store summary", "Günlük mağaza özeti"),
-            txt("Favorite skins and Night Market · 03:00 / 09:00", "Favori skinler ve Gece Pazarı · 03.00 / 09.00"), storeNotice) {
-            storeNotice = it; soundPrefs.edit().putBoolean("notify_store", it).apply(); FavoriteAlerts.schedule(context, it)
-        }
-        HorizontalDivider(color = Raised.copy(alpha = .55f))
-        Row(Modifier.fillMaxWidth().heightIn(min = 55.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text(txt("Match reminders", "Maç hatırlatıcıları"), color = White, fontSize = 14.sp)
-                Text(txt("Saved matches & followed teams", "Kayıtlı maçlar ve takip edilen takımlar"), color = Muted, fontSize = 11.sp)
-            }
-            Switch(matchAlerts, onCheckedChange = onMatchAlerts)
-        }
-        if(matchAlerts) {
-            SectionTitle(txt("Alert intensity", "Bildirim yoğunluğu"))
-            Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                listOf(
-                    Triple("important", txt("Important only", "Sadece önemli"), listOf(true, true, false, false)),
-                    Triple("detailed", txt("Every map", "Her harita"), listOf(true, true, true, true)),
-                    Triple("silent", txt("Silent tracking", "Sessiz takip"), listOf(false, false, false, true))
-                ).forEach { (key, label, values) ->
-                    Chip(label, notificationProfile == key) {
-                        notificationProfile = key
-                        reminderNotice = values[0]; resultNotice = values[1]; mapNotice = values[2]; liveNotice = values[3]
-                        soundPrefs.edit().putString("esports_notification_profile", key)
-                            .putBoolean("notify_esports_reminders", reminderNotice)
-                            .putBoolean("notify_esports_results", resultNotice)
-                            .putBoolean("notify_esports_maps", mapNotice)
-                            .putBoolean("notify_esports_live", liveNotice).apply()
-                        EsportsScoreScheduler.schedule(context, soundPrefs.getString("esports_mode", "off") ?: "off")
-                        EsportsReminders.refreshSoon(context)
-                    }
-                }
-            }
-            NotificationPreferenceRow(txt("15-minute reminder", "15 dakika hatırlatması"),
-                txt("Saved matches, teams and tournaments", "Kayıtlı maç, takım ve turnuvalar"), reminderNotice) {
-                reminderNotice = it; notificationProfile = "custom"; soundPrefs.edit().putString("esports_notification_profile", "custom").putBoolean("notify_esports_reminders", it).apply()
-                EsportsReminders.sync(context, SavedEsportsMatches.get(context) + EsportsRepository(context).cached()?.upcoming.orEmpty())
-            }
-            NotificationPreferenceRow(txt("Final result", "Maç sonucu"),
-                txt("One notification when a followed match ends", "Takip edilen maç bitince tek bildirim"), resultNotice) {
-                resultNotice = it; notificationProfile = "custom"; soundPrefs.edit().putString("esports_notification_profile", "custom").putBoolean("notify_esports_results", it).apply()
-            }
-            NotificationPreferenceRow(txt("Map result", "Harita sonucu"),
-                txt("One alert when a followed match completes a map", "Takip edilen maçta her harita bitince tek uyarı"), mapNotice) {
-                mapNotice = it; notificationProfile = "custom"; soundPrefs.edit().putString("esports_notification_profile", "custom").putBoolean("notify_esports_maps", it).apply()
-            }
-            NotificationPreferenceRow(txt("Live score summary", "Canlı skor özeti"),
-                txt("Compact ongoing card for followed live matches", "Takip edilen canlı maçlar için tek özet kartı"), liveNotice) {
-                liveNotice = it; notificationProfile = "custom"; soundPrefs.edit().putString("esports_notification_profile", "custom").putBoolean("notify_esports_live", it).apply()
-                EsportsScoreScheduler.schedule(context, esportsMode)
-            }
-        }
-        SectionTitle(txt("Live score display", "Canlı skor gösterimi"))
-        Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-            Chip(txt("Off","Kapalı"), esportsMode == "off") { onEsportsMode("off") }
-            Chip(txt("Favorite teams","Favori takımlar"), esportsMode == "favorites") { onEsportsMode("favorites") }
-            Chip(txt("All live","Tüm canlılar"), esportsMode == "all") { onEsportsMode("all") }
-        }
-        Text(if(esportsTeams.isEmpty()) txt("Follow teams from Esports to filter scores.", "Skorları filtrelemek için Espor'dan takım takip et.")
-            else esportsTeams.sorted().joinToString(" · "), color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
-        }
-        HorizontalDivider(color = Raised.copy(alpha = .7f), modifier = Modifier.padding(top = 22.dp))
-        Row(Modifier.fillMaxWidth().clickable { deliveryOpen = !deliveryOpen }.padding(vertical = 15.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(txt("Delivery & permissions", "İzinler ve çalışma şekli"), color = White, fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            Text(if(deliveryOpen) "⌃" else "⌄", color = Muted)
-        }
-        if(deliveryOpen) {
-            NotificationPreferenceRow(txt("Battery saver", "Pil tasarrufu"),
-                txt("Default · widgets every 2 hours, background scores hourly, live matches every 30 seconds", "Varsayılan · widget 2 saatte bir, arka plan skorları saatte bir, canlı maçlar 30 saniyede bir"), batterySaver) {
-                batterySaver = it
-                soundPrefs.edit().putBoolean("battery_saver", it).apply()
-                WidgetRefreshScheduler.schedule(context)
-                EsportsScoreScheduler.schedule(context, esportsMode)
-            }
-            Note(if(batterySaver) txt("Battery saver is on. Live tracking starts at match time and updates only when the displayed score changes. Turn it off only if you prefer faster background checks.",
-                "Pil tasarrufu açık. Canlı takip maç saatinde başlar ve yalnızca ekrandaki skor değişince güncellenir. Daha sık arka plan kontrolü istersen kapatabilirsin.") else txt("Fast checks are on: widgets refresh every 30 minutes, background scores every 15 minutes, and explicit live tracking can poll every 10 seconds.",
-                "Sık kontrol açık: widget 30 dakikada bir, arka plan skorları 15 dakikada bir yenilenir; doğrudan takip edilen canlı maç 10 saniyede bir kontrol edilebilir."))
-            TextButton(onClick = { context.startActivity(Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
-                .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)) }) {
-                Text(txt("Android notification settings", "Android bildirim ayarları"))
-            }
-            if(Build.VERSION.SDK_INT >= 31 && !EsportsReminders.exactAllowed(context)) TextButton(onClick = {
-                runCatching { context.startActivity(Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
-                    Uri.parse("package:${context.packageName}"))) }
-            }) { Text(txt("Allow precise reminders", "Kesin hatırlatıcı izni")) }
-            Note(txt("Samsung Now Bar: enable Live notifications and lock-screen notifications in your phone settings. Availability depends on your device and One UI version.",
-                "Samsung Now Bar: Telefon ayarlarından Canlı bildirimler ve kilit ekranı bildirimlerini aç. Görünürlük cihazına ve One UI sürümüne bağlıdır."))
-        }
-        HorizontalDivider(color = Raised.copy(alpha = .7f))
-        Row(Modifier.fillMaxWidth().clickable { trustOpen = !trustOpen }.padding(vertical = 15.dp), verticalAlignment = Alignment.CenterVertically) {
-            Text(txt("Account & trust", "Hesap ve güven"), color = White, fontSize = 14.sp,
-                fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            Text(if(trustOpen) "⌃" else "⌄", color = Muted)
-        }
-        if(trustOpen) {
-            if(account != null) TextButton(onClick = onLogout) {
-                Text(txt("Sign out of this device", "Bu cihazdan çıkış yap"), color = MaterialTheme.colorScheme.error)
-            }
-            Note(txt("You enter your password on Riot's HTTPS page. Tokens are encrypted on this device; there is no Raund account server. Sign out clears the session and browser cookies.",
-                "Parolanı Riot'un HTTPS sayfasında girersin. Oturum bu cihazda şifrelenir; Raund hesap sunucusu yoktur. Çıkış oturumu ve çerezleri siler."))
-            Note(txt("Independent and not approved by Riot. Store tracking uses undocumented services, so no ban-free guarantee is possible.",
-                "Bağımsız ve Riot tarafından onaylı değil. Mağaza takibi belgelenmemiş servisler kullanır; ban olmayacağı garantisi verilemez."))
-            Note(txt("Esports source: VLR.gg. Source credit is not a license; redistribution requires provider permission. Google/Apple sign-in may require an approved Riot integration rather than this embedded browser.",
-                "Espor kaynağı: VLR.gg. Kaynak belirtmek lisans değildir; dağıtım için sağlayıcı izni gerekir. Google/Apple girişi bu gömülü tarayıcı yerine onaylı Riot entegrasyonu gerektirebilir."))
-            TextButton(onClick = { context.startActivity(Intent(Intent.ACTION_VIEW,
-                Uri.parse("https://support-developer.riotgames.com/hc/en-us/articles/22698769097107-VALORANT"))) }) {
-                Text(txt("Riot policy ↗", "Riot politikası ↗"))
-            }
-        }
-        CompanionSettings(onLogin)
-        Spacer(Modifier.height(20.dp))
-    }
-}
-
-@Composable private fun NotificationPreferenceRow(title: String, subtitle: String, enabled: Boolean, onChange: (Boolean) -> Unit) {
-    Row(Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(title, color = White, fontSize = 14.sp)
-            Text(subtitle, color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
-        }
-        Switch(enabled, onCheckedChange = onChange)
-    }
-}
-
-@Composable private fun SettingsDisclosure(title: String, subtitle: String, expanded: Boolean, onClick: () -> Unit) {
-    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 18.dp), verticalAlignment = Alignment.CenterVertically) {
-        Column(Modifier.weight(1f)) {
-            Text(title, color = White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            Text(subtitle, color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 5.dp))
-        }
-        Text(if(expanded) "−" else "+", color = Muted, fontSize = 22.sp)
-    }
-}
 
 @Composable internal fun DetailPage(title: String, onClose: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
     BackHandler(onBack = onClose)
@@ -1393,123 +1240,5 @@ internal fun normalized(value: String): String = Normalizer.normalize(value.lowe
             Text(title, color = White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(end = 16.dp))
         }
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 24.dp), content = content)
-    }
-}
-@Composable private fun SkinDetailPage(offer: StoreOffer, saved: Boolean, owned: Boolean, onWish: () -> Unit, onCompare: () -> Unit, onClose: () -> Unit) {
-    var variant by remember(offer.id) { mutableIntStateOf(-1) }
-    var imageFailed by remember(offer.id, variant) { mutableStateOf(false) }
-    var playingVideo by remember(offer.id) { mutableStateOf<String?>(null) }
-    DetailPage(offer.name, onClose) {
-        val image = offer.variants.getOrNull(variant)?.image ?: offer.imageUrl
-        if(offer.collection == "playertitles" || image.isNullOrBlank() || imageFailed) {
-            Box(Modifier.fillMaxWidth().height(170.dp), contentAlignment = Alignment.Center) {
-                Text(offer.name, color = White, fontSize = 28.sp, fontWeight = FontWeight.SemiBold)
-            }
-        } else {
-            AsyncImage(image, offer.name, Modifier.fillMaxWidth().height(240.dp).padding(10.dp), contentScale = ContentScale.Fit,
-                onError = { imageFailed = true })
-        }
-        playingVideo?.let { video ->
-            EmbeddedSkinPreview(video, offer.name) { playingVideo = null }
-        }
-        Header(offerDisplayName(offer), offer.weaponLabel())
-        if(offer.metadataPending) Note(txt("This item is preserved while its public name and artwork are pending. Refresh the store later; a missing image does not mean it is not owned.",
-            "Bu öğe, herkese açık ad ve görseli beklenirken korunuyor. Mağazayı daha sonra yenile; görsel eksikliği öğeye sahip olmadığın anlamına gelmez."))
-        if(owned) Text(txt("✓ Owned in your Riot inventory","✓ Riot envanterinde sahipsin"), color = Green,
-            fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-        else Price(offer)
-        if(owned && offer.ownedLevelNames.orEmpty().isNotEmpty()) {
-            SectionTitle(txt("Owned levels","Sahip olduğun seviyeler"), offer.ownedLevelNames.orEmpty().size.toString())
-            offer.ownedLevelNames.orEmpty().forEach { level ->
-                Text("✓  $level", color = White, fontSize = 12.sp, modifier = Modifier.padding(vertical = 5.dp))
-            }
-        }
-        Button(onClick = onWish, modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp), shape = CircleShape, colors = ButtonDefaults.buttonColors(containerColor = if(saved) Raised else Accent)) { Text(if(saved) txt("♥ Saved · remove","♥ Kaydedildi · kaldır") else txt("♡ Add to favorites","♡ Favorilere ekle"), color = if(saved) White else MaterialTheme.colorScheme.onPrimary) }
-        TextButton(onClick = onCompare, modifier = Modifier.fillMaxWidth()) { Text(txt("Compare with another skin", "Başka bir skinle karşılaştır")) }
-        if(offer.variants.isNotEmpty()) {
-            SectionTitle(txt("Variants & upgrades","Renkler ve geliştirmeler"))
-            if(owned) Note(txt("These are catalog previews; only the levels listed above are confirmed owned.",
-                "Bunlar katalog önizlemeleridir; yalnızca yukarıda yazan seviyelerin sahipliği doğrulandı."))
-            offer.variants.forEachIndexed { index, value ->
-                Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(if(variant == index) Raised else Color.Transparent).clickable { variant = index }.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    AsyncImage(value.image ?: offer.imageUrl, value.name, Modifier.width(75.dp).height(48.dp), contentScale = ContentScale.Fit)
-                    Text(value.name, color = White, fontSize = 12.sp, modifier = Modifier.weight(1f).padding(horizontal = 10.dp))
-                    value.video?.let { video -> TextButton(onClick = { playingVideo = video }) {
-                        Text(if(playingVideo == video) txt("Playing","Oynuyor") else txt("▶ Preview","▶ Ön izle"), color = Accent)
-                    } }
-                }
-            }
-        }
-        if(!owned && offer.priceVp < 0) Note(txt("Collection entry. Availability and price appear only when Riot returns an active offer. Limited and Battle Pass skins may not enter the daily store.", "Koleksiyon kaydı. Satış durumu ve fiyat, Riot aktif teklif döndürdüğünde görünür. Sınırlı ve Savaş Bileti skinleri günlük mağazaya gelmeyebilir."))
-    }
-}
-
-@Composable private fun EmbeddedSkinPreview(url: String, title: String, onClose: () -> Unit) {
-    val context = LocalContext.current
-    val owner = androidx.lifecycle.compose.LocalLifecycleOwner.current
-    var resumePlayback by remember(url) { mutableStateOf(false) }
-    var error by remember(url) { mutableStateOf(false) }
-    var loading by remember(url) { mutableStateOf(true) }
-    val player = remember(url) {
-        ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(url))
-            repeatMode = Player.REPEAT_MODE_ONE
-            playWhenReady = true
-            prepare()
-        }
-    }
-    DisposableEffect(player) {
-        val listener = object : Player.Listener {
-            override fun onPlaybackStateChanged(state: Int) { loading = state == Player.STATE_BUFFERING }
-            override fun onPlayerError(cause: PlaybackException) { error = true; loading = false }
-        }
-        player.addListener(listener)
-        onDispose { player.removeListener(listener); player.release() }
-    }
-    DisposableEffect(owner, player) {
-        val observer = LifecycleEventObserver { _, event ->
-            if(event == Lifecycle.Event.ON_STOP) { resumePlayback = player.playWhenReady; player.pause() }
-            if(event == Lifecycle.Event.ON_START && resumePlayback) { player.play(); resumePlayback = false }
-        }
-        owner.lifecycle.addObserver(observer)
-        onDispose { owner.lifecycle.removeObserver(observer) }
-    }
-    Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
-        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-            Text(txt("In-app preview","Uygulama içi ön izleme"), color = White, fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-            TextButton(onClick = onClose) { Text("×") }
-        }
-        Box(Modifier.fillMaxWidth().height(220.dp).clip(RoundedCornerShape(14.dp)).background(Color.Black), contentAlignment = Alignment.Center) {
-            AndroidView(factory = { viewContext -> PlayerView(viewContext).apply { this.player = player; useController = true } },
-                update = { it.player = player }, modifier = Modifier.fillMaxSize())
-            if(loading && !error) CircularProgressIndicator(color = Color.White, modifier = Modifier.size(32.dp))
-            if(error) Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(txt("Preview could not be played", "Ön izleme oynatılamadı"), color = Color.White, fontSize = 12.sp)
-                TextButton(onClick = { error = false; loading = true; player.prepare(); player.play() }) { Text(txt("Retry", "Tekrar dene")) }
-            }
-        }
-        Text(title, color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 5.dp))
-    }
-}
-
-@Composable private fun VerifiedRiotLogin(onSession: (RiotSession) -> Unit, onCancel: () -> Unit) {
-    val context = LocalContext.current
-    val tr = LocalTurkish.current
-    val latestSession by rememberUpdatedState(onSession)
-    val latestCancel by rememberUpdatedState(onCancel)
-    var launched by rememberSaveable { mutableStateOf(false) }
-    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-        val access = result.data?.getStringExtra(RiotLoginActivity.ACCESS)
-        val id = result.data?.getStringExtra(RiotLoginActivity.ID)
-        if(result.resultCode == android.app.Activity.RESULT_OK && !access.isNullOrBlank() && !id.isNullOrBlank())
-            latestSession(RiotSession(access, id))
-        else latestCancel()
-    }
-    LaunchedEffect(Unit) {
-        if(!launched) {
-            launched = true
-            launcher.launch(Intent(context, RiotLoginActivity::class.java).putExtra(RiotLoginActivity.LOCALE, if(tr) "tr-tr" else "en-us"))
-        }
     }
 }

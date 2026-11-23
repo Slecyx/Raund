@@ -4,9 +4,11 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -21,8 +23,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.Locale
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun InventoryPage(account: LiveStoreAccount?, refreshing: Boolean, onRefresh: () -> Unit,
-                                      onSkin: (StoreOffer, Boolean) -> Unit, onBack: () -> Unit) {
+                                      onSkin: (StoreOffer, Boolean) -> Unit, onLoadout: () -> Unit = {}, onBack: () -> Unit) {
     BackHandler(onBack = onBack)
     val context = LocalContext.current
     val turkish = LocalTurkish.current
@@ -40,6 +43,8 @@ import java.util.Locale
     var weaponMenu by remember { mutableStateOf(false) }
     var retry by remember { mutableIntStateOf(0) }
     var showSeries by remember { mutableStateOf(false) }
+    var showRpCalc by remember { mutableStateOf(false) }
+    var offerPrices by remember(account?.accountId) { mutableStateOf<Map<String, Int>?>(null) }
     var seriesCatalog by remember { mutableStateOf<List<StoreOffer>?>(null) }
     var themeNames by remember(turkish) { mutableStateOf<Map<String, String>>(emptyMap()) }
     var seriesError by remember { mutableStateOf(false) }
@@ -65,6 +70,15 @@ import java.util.Locale
             .onSuccess { skins = it; metadataError = false }
             .onFailure { metadataError = true }
     }
+    LaunchedEffect(account?.accountId, inventory?.checkedAt) {
+        if(account == null || inventory == null) return@LaunchedEffect
+        offerPrices = withContext(Dispatchers.IO) {
+            runCatching {
+                val session = SessionStore(context).validSession()
+                RiotLiveGateway(context).loadStoreOfferPrices(session)
+            }.getOrNull()
+        }
+    }
     val filtered = skins.orEmpty().filter {
         (weapon == null || it.weaponLabel() == weapon) &&
             (normalized(it.name).contains(normalized(search)) || normalized(localizedNames[it.id].orEmpty()).contains(normalized(search)))
@@ -78,15 +92,33 @@ import java.util.Locale
                 Text(if(refreshing) txt("Updating…","Yenileniyor…") else txt("Refresh","Yenile"))
             }
         }
-        LazyColumn(contentPadding = PaddingValues(horizontal = 22.dp, vertical = 8.dp)) {
+        PullToRefreshBox(isRefreshing = refreshing, onRefresh = onRefresh, modifier = Modifier.weight(1f).fillMaxWidth()) {
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(horizontal = 22.dp, vertical = 8.dp)) {
             item {
                 Text(txt("My inventory","Envanterim"), color = White, fontSize = 32.sp, fontWeight = FontWeight.Bold)
                 Text(account?.name.orEmpty(), color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
                 if(inventory != null && inventory.schemaVersion >= 1) {
-                    Text((skins?.size?.toString() ?: "…") + " " + txt(if(skins?.size == 1) "owned weapon skin" else "owned weapon skins","sahip olduğun skin"),
-                        color = Accent, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 17.dp))
-                    Text(txt("Checked ","Kontrol ") + timeLabel(inventory.checkedAt), color = Muted,
-                        fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp, bottom = 18.dp))
+                    val upgradedLevels = remember(skins) { skins.orEmpty().sumOf { it.ownedLevelNames.orEmpty().size } }
+                    val topWeapon = remember(skins) { skins.orEmpty().groupingBy { it.weaponLabel() }.eachCount().maxByOrNull { it.value } }
+                    val valueSummary = remember(skins, offerPrices) {
+                        val s = skins; val p = offerPrices
+                        if(s != null && p != null) InventoryValueCalculator.calculate(s, p) else null
+                    }
+                    Row(Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 6.dp)) {
+                        Stat(skins?.size?.toString() ?: "…", txt("Skins", "Skin"), Modifier.weight(1f))
+                        Stat(if(skins == null) "…" else upgradedLevels.toString(), txt("Owned levels", "Seviye"), Modifier.weight(1f))
+                        Stat(valueSummary?.let { "${it.totalVp} VP" } ?: topWeapon?.let { "${it.key} (${it.value})" } ?: "—",
+                            if(valueSummary != null) txt("Store VP value", "Mağaza VP değeri") else txt("Top weapon", "En çok"), Modifier.weight(1.3f))
+                    }
+                    valueSummary?.let { v ->
+                        Text(txt("Calculated from ${v.pricedSkins} store-priced skins · ${v.unpricedSkins} Battle Pass / non-store items excluded",
+                            "${v.pricedSkins} mağaza fiyatlı skinden hesaplandı · ${v.unpricedSkins} Savaş Bileti / mağaza dışı öğe hariç"),
+                            color = Muted, fontSize = 10.sp, modifier = Modifier.padding(bottom = 6.dp))
+                    }
+                    Row(Modifier.fillMaxWidth().padding(bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(txt("Checked ","Kontrol ") + timeLabel(inventory.checkedAt), color = Muted, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                        TextButton(onClick = onLoadout) { Text(txt("Edit loadout ›", "Loadout düzenle ›"), fontSize = 12.sp) }
+                    }
                 }
                 when {
                     account == null -> Note(txt("Connect your Riot account from Store to see owned skins.","Sahip olduğun skinleri görmek için Mağaza'dan Riot hesabını bağla."))
@@ -101,10 +133,21 @@ import java.util.Locale
                     inventory.skinLevelIds.isEmpty() -> Note(txt("No owned skins were found for this account.","Bu hesapta sahip olunan skin bulunamadı."))
                     else -> {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 12.dp)) {
-                            Chip(txt("Skins", "Skinler"), !showSeries) { showSeries = false }
-                            Chip(txt("Series progress", "Seri ilerlemesi"), showSeries) { showSeries = true }
+                            Chip(txt("Skins", "Skinler"), !showSeries && !showRpCalc) { showSeries = false; showRpCalc = false }
+                            Chip(txt("Series", "Seriler"), showSeries && !showRpCalc) { showSeries = true; showRpCalc = false }
+                            Chip(txt("RP calc", "RP hesapla"), showRpCalc) { showRpCalc = true; showSeries = false }
                         }
-                        if(!showSeries) {
+                        if(showRpCalc) {
+                            RadianiteCalculatorCard(account.snapshot.balances["RP"])
+                        } else if(!showSeries) {
+                        val weaponCounts = remember(skins) {
+                            skins.orEmpty().groupingBy { it.weaponLabel() }.eachCount().entries.sortedByDescending { it.value }.take(8)
+                        }
+                        if(weaponCounts.isNotEmpty()) LazyRow(Modifier.fillMaxWidth().padding(bottom = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            items(weaponCounts, key = { it.key }) { (label, count) ->
+                                Chip("$label · $count", weapon == label) { weapon = if(weapon == label) null else label }
+                            }
+                        }
                         OutlinedTextField(search, { search = it }, Modifier.fillMaxWidth(), singleLine = true,
                             shape = RoundedCornerShape(14.dp), placeholder = { Text(txt("Search your skins","Skinlerinde ara")) })
                         Row(Modifier.fillMaxWidth().padding(vertical = 11.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -166,7 +209,7 @@ import java.util.Locale
                     HorizontalDivider(color = Raised.copy(alpha = .65f))
                 }
             }
-            if(!showSeries && inventory != null && inventory.schemaVersion >= 1 && skins != null && !metadataError) {
+            if(!showSeries && !showRpCalc && inventory != null && inventory.schemaVersion >= 1 && skins != null && !metadataError) {
                 var previous: String? = null
                 filtered.forEach { offer ->
                     if(offer.weaponLabel() != previous) {
@@ -199,6 +242,7 @@ import java.util.Locale
                 }
             }
             item { Spacer(Modifier.height(26.dp)) }
+        }
         }
     }
 }

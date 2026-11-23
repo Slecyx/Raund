@@ -14,8 +14,24 @@ internal fun JSONObject.textOrNull(key: String): String? = optString(key).takeIf
 /** Public game assets only. No Riot credentials are sent to this service. */
 class ContentCatalog(private val context: Context) {
     companion object {
+        private const val MAX_CATALOG_CHARS = 24 * 1024 * 1024
         private val cacheLocks = java.util.concurrent.ConcurrentHashMap<String, Any>()
         private val pendingItems = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, StoreOffer>>()
+        private fun readBounded(connection: HttpURLConnection): String = try {
+            val code = connection.responseCode
+            if(code !in 200..299) error("Catalog HTTP $code")
+            connection.inputStream.bufferedReader().use { reader ->
+                val output = StringBuilder()
+                val buffer = CharArray(8_192)
+                while(true) {
+                    val count = reader.read(buffer)
+                    if(count < 0) break
+                    if(output.length + count > MAX_CATALOG_CHARS) error("Catalog response too large")
+                    output.append(buffer, 0, count)
+                }
+                output.toString()
+            }
+        } finally { connection.disconnect() }
     }
     private val memory = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, JSONArray>>()
     private var skinMemory: List<StoreOffer>? = null
@@ -33,7 +49,7 @@ class ContentCatalog(private val context: Context) {
         return try {
             val connection = URL("https://valorant-api.com/v1/$path?language=$language").openConnection() as HttpURLConnection
             connection.connectTimeout = 10_000; connection.readTimeout = 15_000
-            val raw = try { connection.inputStream.bufferedReader().use { it.readText() } } finally { connection.disconnect() }
+            val raw = readBounded(connection)
             val result = JSONObject(raw).getJSONArray("data")
             val output = atomic.startWrite()
             try { output.write(raw.toByteArray(Charsets.UTF_8)); atomic.finishWrite(output) }
@@ -108,10 +124,10 @@ class ContentCatalog(private val context: Context) {
             card.textOrNull("wideArt") ?: card.textOrNull("largeArt"))
     }
 
-    private fun single(path: String, id: String): JSONObject? = runCatching {
+    private fun single(path: String, id: String): JSONObject? = if(!RiotLiveGateway.isRiotId(id)) null else runCatching {
         val connection = URL("https://valorant-api.com/v1/$path/$id?language=en-US").openConnection() as HttpURLConnection
         connection.connectTimeout = 10_000; connection.readTimeout = 15_000
-        val raw = try { connection.inputStream.bufferedReader().use { it.readText() } } finally { connection.disconnect() }
+        val raw = readBounded(connection)
         JSONObject(raw).optJSONObject("data")
     }.getOrNull()
 

@@ -48,6 +48,9 @@ object MatchAnalysis {
 internal fun MatchDetailPage(match: MatchSummary, agents: Map<String, JSONObject>, maps: Map<String, JSONObject>,
                              history: List<MatchSummary> = emptyList(), onClose: () -> Unit) {
     val raw = remember(match.id) { match.detailsJson?.let { runCatching { JSONObject(it) }.getOrNull() } }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val tr = LocalTurkish.current
+    var showCallouts by remember { mutableStateOf(false) }
     var tab by remember { mutableIntStateOf(0) }
     var expanded by remember { mutableIntStateOf(-1) }
     val players = remember(raw) { raw?.optJSONArray("players").objects() }
@@ -56,9 +59,12 @@ internal fun MatchDetailPage(match: MatchSummary, agents: Map<String, JSONObject
     val rounds = remember(raw) { raw?.optJSONArray("roundResults").objects() }
     val mapMeta = maps[match.map]
     val replay = remember(raw, match.playerId, mapMeta) { raw?.let {
+        val xScalar = mapMeta?.optDouble("xScalarToAdd", Double.NaN)?.takeUnless(Double::isNaN)
+            ?: mapMeta?.optDouble("xScalar", 0.0) ?: 0.0
+        val yScalar = mapMeta?.optDouble("yScalarToAdd", Double.NaN)?.takeUnless(Double::isNaN)
+            ?: mapMeta?.optDouble("yScalar", 0.0) ?: 0.0
         RaundReplayAnalysis.calculate(it, match.playerId, mapMeta?.optDouble("xMultiplier", 1.0) ?: 1.0,
-            mapMeta?.optDouble("yMultiplier", 1.0) ?: 1.0, mapMeta?.optDouble("xScalar", 0.0) ?: 0.0,
-            mapMeta?.optDouble("yScalar", 0.0) ?: 0.0)
+            mapMeta?.optDouble("yMultiplier", 1.0) ?: 1.0, xScalar, yScalar)
     } }
     fun agentFor(subject: String): String {
         val player = players.find { it.optString("subject") == subject }
@@ -73,6 +79,14 @@ internal fun MatchDetailPage(match: MatchSummary, agents: Map<String, JSONObject
                 Text(match.map + "  " + match.score, color = Color.White, fontSize = 31.sp, fontWeight = FontWeight.Bold)
                 Text(timeLabel(match.startedAt), color = Color.White.copy(.8f), fontSize = 11.sp)
             }
+        }
+        if(showCallouts) MapCalloutDialog(match.map, mapMeta) { showCallouts = false }
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if(mapMeta != null) TextButton(onClick = { showCallouts = true }) { Text(txt("Map callouts", "Harita bölgeleri")) }
+            if(raw != null) TextButton(onClick = {
+                val m = MatchAnalysis.metrics(raw, match.playerId)
+                ShareSummaries.shareText(context, "${match.map} ${match.score}", ShareSummaries.matchSummary(match, m, tr))
+            }) { Text(txt("Share ↗", "Paylaş ↗")) }
         }
         if(raw == null) {
             Note(txt("Riot did not return this match's details. Refresh your career and try again.", "Riot bu maçın ayrıntılarını döndürmedi. Kariyeri yenileyip tekrar dene."))

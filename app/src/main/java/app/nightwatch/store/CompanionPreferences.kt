@@ -57,16 +57,23 @@ internal object PreferenceBackup {
         if(key == WatchLater.KEY) return Gson().toJson(WatchLater.decode(raw))
         fun image(url: String?) = url?.takeIf { it.startsWith("https://owcdn.net/") || it.startsWith("https://www.vlr.gg/img/") }
         if(key == "esports_matches") {
-            val matches = Gson().fromJson(raw, Array<EsportsMatch>::class.java).toList()
+            val matches = Gson().fromJson(raw, Array<EsportsMatch?>::class.java)?.toList()
+                ?: throw IllegalArgumentException("Invalid matches")
             require(matches.size <= 200 && matches.all(MatchNavigation::valid))
-            return Gson().toJson(matches.distinctBy { it.id }.map {
+            return Gson().toJson(matches.filterNotNull().distinctBy { it.id }.map {
                 EsportsMatch(it.id, it.team1, it.team2, it.score1, it.score2, it.event.take(200), it.series.take(200), it.status,
                     it.whenText.take(120), "https://www.vlr.gg/${it.id}", it.startAtMillis, image(it.team1Logo), image(it.team2Logo), image(it.eventIcon))
             })
         }
-        val events = Gson().fromJson(raw, Array<EsportsEvent>::class.java).toList()
-        require(events.size <= 100 && events.all { Regex("^[0-9]{1,12}$").matches(it.id) && it.title.isNotBlank() && it.title.length <= 200 })
-        return Gson().toJson(events.distinctBy { it.id }.map {
+        val events = Gson().fromJson(raw, Array<EsportsEvent?>::class.java)?.toList()
+            ?: throw IllegalArgumentException("Invalid events")
+        require(events.size <= 100 && events.all { event ->
+            event != null &&
+                (event.id as String?)?.let { Regex("^[0-9]{1,12}$").matches(it) } == true &&
+                !(event.title as String?).isNullOrBlank() && event.title.length <= 200 &&
+                (event.status as String?) != null && (event.dates as String?) != null
+        })
+        return Gson().toJson(events.filterNotNull().distinctBy { it.id }.map {
             EsportsEvent(it.id, it.title, "https://www.vlr.gg/event/${it.id}", image(it.image), it.status.take(80), it.dates.take(120))
         })
     }
@@ -110,19 +117,134 @@ internal object RaundArchive {
         val root = JSONObject(raw)
         require(root.optString("app") == "Raund") { "Unsupported backup" }
         val version = root.optInt("version")
-        val preferenceRoot = JSONObject(root.toString()).put("version", 1)
+        // Validate preferences in isolation so a large v2 account snapshot does not trip the
+        // 250 KB preference-only size limit.
+        val preferenceRoot = JSONObject()
+            .put("app", "Raund")
+            .put("version", 1)
+            .put("preferences", root.getJSONObject("preferences"))
         val preferences = PreferenceBackup.decode(preferenceRoot.toString())
         if(version == 1) return RaundArchivePayload(preferences, null)
         require(version == 2) { "Unsupported backup" }
         val account = root.optJSONObject("account")?.let { value ->
-            Gson().fromJson(value.toString(), LiveStoreAccount::class.java).also { candidate ->
-                require(candidate.name.length in 1..100 && candidate.region.length in 1..16)
-                require(candidate.snapshot.offers.size <= 50 && candidate.snapshot.accessories.size <= 100)
-                require((candidate.career?.matches?.size ?: 0) <= 400)
-                require((candidate.inventory?.skinLevelIds?.size ?: 0) <= 10_000)
-            }
+            val candidate = Gson().fromJson(value.toString(), LiveStoreAccount::class.java)
+                ?: throw IllegalArgumentException("Invalid account")
+            sanitizeAccount(candidate)
         }
         return RaundArchivePayload(preferences, account)
+    }
+
+    private fun httpsOnly(url: String?): String? = url?.takeIf { it.startsWith("https://") && it.length <= 512 }
+
+    private fun sanitizeOffer(offer: StoreOffer): StoreOffer {
+        val id: String? = offer.id
+        val name: String? = offer.name
+        val collection: String? = offer.collection
+        val weapon: WeaponType? = offer.weapon
+        val tier: String? = offer.tier
+        val currency: String? = offer.currency
+        require(!id.isNullOrBlank() && id.length <= 128 && !name.isNullOrBlank() && name.length <= 200)
+        val safeVariants = (offer.variants as List<SkinVariant?>?).orEmpty().filterNotNull().take(20).mapNotNull { variant ->
+            val variantName: String? = variant.name
+            if(variantName.isNullOrBlank()) null
+            else SkinVariant(variantName.take(160), httpsOnly(variant.image), httpsOnly(variant.video))
+        }
+        return offer.copy(
+            id = id,
+            name = name,
+            collection = collection.orEmpty().take(160),
+            weapon = weapon ?: WeaponType.OTHER,
+            tier = tier.orEmpty().take(80),
+            palette = (offer.palette as List<Long>?).orEmpty().take(8),
+            imageUrl = httpsOnly(offer.imageUrl),
+            variants = safeVariants,
+            currency = currency?.takeIf { it in setOf("VP", "KC", "RP") } ?: "VP",
+            ownedLevelNames = offer.ownedLevelNames?.filterNotNull()?.take(20)?.map { it.take(160) }
+        )
+    }
+
+    private fun sanitizeAccount(candidate: LiveStoreAccount): LiveStoreAccount {
+        // Gson can inject null into Kotlin non-null properties when restoring untrusted JSON.
+        val name: String? = candidate.name
+        val region: String? = candidate.region
+        val snapshot: StoreSnapshot? = candidate.snapshot
+        require(!name.isNullOrBlank() && name.length in 1..100)
+        require(!region.isNullOrBlank() && region.length in 1..16)
+        require(snapshot != null)
+        val rawOffers = (snapshot.offers as List<StoreOffer?>?).orEmpty()
+        val rawNight = (snapshot.nightOffers as List<StoreOffer?>?).orEmpty()
+        val rawAccessories = (snapshot.accessories as List<StoreOffer?>?).orEmpty()
+        val rawBundles = (snapshot.bundles as List<StoreBundle?>?).orEmpty()
+        require(rawOffers.size <= 50 && rawNight.size <= 50 && rawAccessories.size <= 100 && rawBundles.size <= 20)
+        val safeSnapshot = snapshot.copy(
+            offers = rawOffers.filterNotNull().map(::sanitizeOffer),
+            nightOffers = rawNight.filterNotNull().map(::sanitizeOffer),
+            accessories = rawAccessories.filterNotNull().map(::sanitizeOffer),
+            bundles = rawBundles.filterNotNull().mapNotNull { bundle ->
+                val bundleId: String? = bundle.id
+                val bundleName: String? = bundle.name
+                if(bundleId.isNullOrBlank() || bundleName.isNullOrBlank()) null
+                else bundle.copy(
+                    id = bundleId.take(128),
+                    name = bundleName.take(200),
+                    image = httpsOnly(bundle.image),
+                    items = (bundle.items as List<StoreOffer?>?).orEmpty().filterNotNull().take(40).map(::sanitizeOffer)
+                )
+            },
+            balances = (snapshot.balances as Map<String, Int>?).orEmpty().filterKeys { it in setOf("VP", "RP", "KC") }
+        )
+        val safeCareer = candidate.career?.let { career ->
+            val rawMatches = (career.matches as List<MatchSummary?>?).orEmpty()
+            require(rawMatches.size <= 400)
+            career.copy(
+                rank = (career.rank as String?).orEmpty().take(80).ifBlank { "Unrated" },
+                matches = rawMatches.filterNotNull().mapNotNull { match ->
+                    val matchId: String? = match.id
+                    if(matchId.isNullOrBlank() || matchId.length > 128) null
+                    else match.copy(
+                        id = matchId,
+                        map = (match.map as String?).orEmpty().take(80),
+                        mode = (match.mode as String?).orEmpty().take(80),
+                        score = (match.score as String?).orEmpty().take(32),
+                        playerId = (match.playerId as String?).orEmpty().take(128),
+                        agentId = (match.agentId as String?).orEmpty().take(128),
+                        mapImage = httpsOnly(match.mapImage)
+                    )
+                }
+            )
+        }
+        val safeProgress = candidate.progress?.let { progress ->
+            progress.copy(
+                battlePassName = progress.battlePassName?.take(160),
+                rewards = (progress.rewards as List<PassReward?>?).orEmpty().filterNotNull().take(100).map { reward ->
+                    reward.copy(name = (reward.name as String?).orEmpty().take(160), image = httpsOnly(reward.image))
+                },
+                missions = (progress.missions as List<MissionProgress?>?).orEmpty().filterNotNull().take(50).map { mission ->
+                    mission.copy(name = (mission.name as String?).orEmpty().take(200))
+                }
+            )
+        }
+        val safeInventory = candidate.inventory?.let { inventory ->
+            val ids = (inventory.skinLevelIds as List<String?>?).orEmpty().filterNotNull()
+            require(ids.size <= 10_000)
+            inventory.copy(skinLevelIds = ids.filter { it.isNotBlank() && it.length <= 128 })
+        }
+        val safeCard = candidate.playerCard?.let { card ->
+            val cardId: String? = card.id
+            if(cardId.isNullOrBlank() || cardId.length > 128) null
+            else card.copy(id = cardId, small = httpsOnly(card.small), wide = httpsOnly(card.wide))
+        }
+        return candidate.copy(
+            name = name,
+            region = region,
+            snapshot = safeSnapshot,
+            career = safeCareer,
+            progress = safeProgress,
+            warnings = (candidate.warnings as List<String?>?).orEmpty().filterNotNull().take(16),
+            accountId = candidate.accountId?.take(128),
+            inventory = safeInventory,
+            playerCard = safeCard
+        )
     }
 
     fun restore(context: Context, payload: RaundArchivePayload) {

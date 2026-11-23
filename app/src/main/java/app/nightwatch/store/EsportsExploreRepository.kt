@@ -9,8 +9,10 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import java.net.URI
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 internal data class EsportsEvent(val id: String, val title: String, val url: String, val image: String?,
@@ -80,6 +82,15 @@ internal object EsportsPortraits {
 }
 
 internal object EsportsExploreParser {
+    internal fun isAllowedSocialUrl(raw: String): Boolean {
+        val uri = runCatching { URI(raw) }.getOrNull() ?: return false
+        if(uri.scheme != "https" || uri.userInfo != null) return false
+        val host = uri.host?.lowercase(Locale.ROOT) ?: return false
+        return setOf("x.com", "twitter.com", "twitch.tv", "youtube.com", "instagram.com").any { allowed ->
+            host == allowed || host.endsWith(".$allowed")
+        }
+    }
+
     private fun safeImage(raw: String?): String? = raw?.trim()?.let {
         when {
             it.startsWith("https://") -> it
@@ -250,9 +261,7 @@ internal object EsportsExploreParser {
             safeImage(header?.selectFirst(".wf-avatar img")?.absUrl("src")), url)
         val country = header?.select(".ge-text-light")?.firstOrNull { it.selectFirst("i.flag") != null }?.text()?.trim().orEmpty()
         val socials = page.select(".player-header a[target=_blank][href]").mapNotNull { link ->
-            val href = link.absUrl("href").takeIf { social -> social.startsWith("https://") &&
-                listOf("x.com/", "twitter.com/", "twitch.tv/", "youtube.com/", "instagram.com/").any(social::contains) }
-                ?: return@mapNotNull null
+            val href = link.absUrl("href").takeIf(::isAllowedSocialUrl) ?: return@mapNotNull null
             PlayerSocial(link.text().trim().ifBlank { UriLabel.social(href) }, href)
         }.distinctBy { it.url }
         val agents = page.select("table.st-table.mod-agent-rows tbody tr").mapNotNull { row ->
@@ -272,6 +281,7 @@ internal object EsportsExploreParser {
             val event = row.selectFirst(".text-of")?.text()?.trim().orEmpty()
             if(event.isBlank()) return@mapNotNull null
             val href = row.attr("href")
+            if(!Regex("^/event/\\d+(?:/.*)?$").matches(href)) return@mapNotNull null
             val results = row.select("div[style*=margin-top: 5px]").map { it.text().trim() }.filter(String::isNotBlank)
             val year = row.children().lastOrNull()?.ownText()?.trim().orEmpty()
             PlayerAchievement(event, "https://www.vlr.gg$href", results, year)
@@ -319,17 +329,18 @@ internal object EsportsExploreParser {
                 ?.map { it.text().trim().toIntOrNull() }.orEmpty()
             val logos = row.select(".m-item-logo img").take(2).map { safeImage(it.absUrl("src")) }
             val internal = result?.attr("data-match-id").orEmpty()
-            val mapRows = internal.takeIf(String::isNotBlank)?.let { page.selectFirst(".m-item-games.match-id-$it") }
+            val mapRows = internal.takeIf { Regex("^[0-9A-Za-z_-]{1,32}$").matches(it) }?.let { page.selectFirst(".m-item-games.match-id-$it") }
                 ?.select("a.m-item-games-item[href]").orEmpty().map { game ->
                     val kda = game.selectFirst(".pg-stat[title*=Kills] .pg-v")?.text()?.split('/')?.map { it.trim().toIntOrNull() }.orEmpty()
                     val outcome = game.selectFirst(".m-item-games-result")
+                    val gameHref = game.attr("href").takeIf { it.startsWith("/") && !it.startsWith("//") } ?: "/$id"
                     PlayerMapPerformance(
                         game.selectFirst(".m-item-games-comp-group img")?.attr("alt")?.trim().orEmpty(),
                         safeImage(game.selectFirst(".m-item-games-comp-group img")?.absUrl("src")),
                         game.selectFirst(".map")?.text()?.trim().orEmpty(), game.selectFirst(".score")?.text()?.trim().orEmpty(),
                         game.selectFirst(".pg-stat.mod-r .pg-v")?.text()?.trim().orEmpty(), kda.getOrNull(0), kda.getOrNull(1),
                         kda.getOrNull(2), when { outcome?.hasClass("mod-win") == true -> true; outcome?.hasClass("mod-loss") == true -> false; else -> null },
-                        "https://www.vlr.gg${game.attr("href")}")
+                        "https://www.vlr.gg$gameHref")
                 }
             val eventNode = row.selectFirst(".m-item-event")
             PlayerMatchPerformance(id, eventNode?.selectFirst("div")?.text()?.trim().orEmpty(),
@@ -352,6 +363,19 @@ private object UriLabel {
 internal class EsportsExploreRepository(private val context: Context) {
     private val prefs = context.getSharedPreferences("esports_explore_cache", Context.MODE_PRIVATE)
     private val gson = Gson()
+    private fun saveCached(key: String, payload: String) {
+        val now = System.currentTimeMillis()
+        prefs.edit().apply {
+            putString(key, payload)
+            putLong("${key}_at", now)
+            // Keep events/news pinned and evict the oldest search/team/player/tournament entries.
+            prefs.all.entries
+                .filter { it.key.endsWith("_at") && it.value is Long && it.key != "events_at" && it.key != "news_at" && it.key != "${key}_at" }
+                .sortedByDescending { it.value as Long }
+                .drop(100)
+                .forEach { (atKey, _) -> remove(atKey); remove(atKey.removeSuffix("_at")) }
+        }.apply()
+    }
     private fun page(path: String) = Jsoup.connect("https://www.vlr.gg$path")
         .userAgent("Raund/0.11 Android companion").timeout(14_000).maxBodySize(2_000_000).get().outerHtml()
     fun cachedEvents(): List<EsportsEvent> = ExploreMemory.events ?: runCatching {
@@ -387,7 +411,7 @@ internal class EsportsExploreRepository(private val context: Context) {
             return@withContext old
         val encoded = URLEncoder.encode(normalized, StandardCharsets.UTF_8.toString())
         val fresh = EsportsExploreParser.teamSearch(page("/search/?q=$encoded&type=teams"))
-        prefs.edit().putString(key, gson.toJson(fresh)).putLong("${key}_at", System.currentTimeMillis()).apply()
+        saveCached(key, gson.toJson(fresh))
         fresh
     }
     suspend fun searchPlayers(query: String): List<EsportsPlayerSearchResult> = withContext(Dispatchers.IO) {
@@ -401,7 +425,7 @@ internal class EsportsExploreRepository(private val context: Context) {
             return@withContext old
         val encoded = URLEncoder.encode(normalized, StandardCharsets.UTF_8.toString())
         val fresh = EsportsExploreParser.playerSearch(page("/search/?q=$encoded&type=players"))
-        prefs.edit().putString(key, gson.toJson(fresh)).putLong("${key}_at", System.currentTimeMillis()).apply()
+        saveCached(key, gson.toJson(fresh))
         fresh
     }
     fun cachedTournament(event: EsportsEvent): TournamentDetail? = prefs.getString("event_v4_${event.id}", null)?.let {
@@ -431,7 +455,7 @@ internal class EsportsExploreRepository(private val context: Context) {
         val old = prefs.getString(key, null)?.let { runCatching { gson.fromJson(it, TournamentDetail::class.java) }.getOrNull() }
         if(!force && old != null && System.currentTimeMillis() - prefs.getLong("${key}_at", 0L) < 30 * 60_000L) return@withContext old
         EsportsExploreParser.tournament(event, page("/event/${event.id}")).also {
-            prefs.edit().putString(key, gson.toJson(it)).putLong("${key}_at", System.currentTimeMillis()).apply()
+            saveCached(key, gson.toJson(it))
         }
     }
     suspend fun team(url: String): EsportsTeam = withContext(Dispatchers.IO) {
@@ -447,7 +471,7 @@ internal class EsportsExploreRepository(private val context: Context) {
         team.copy(matches = (team.matches + history).distinctBy { it.id }).also {
             EsportsPortraits.remember(it.players)
             ExploreMemory.teams[id] = it
-            prefs.edit().putString(cacheKey, gson.toJson(it)).putLong("${cacheKey}_at", System.currentTimeMillis()).apply()
+            saveCached(cacheKey, gson.toJson(it))
         }
     }
     suspend fun player(url: String, period: String = "60d", force: Boolean = false, includeMatches: Boolean = true): PlayerProfile = withContext(Dispatchers.IO) {
@@ -482,14 +506,14 @@ internal class EsportsExploreRepository(private val context: Context) {
             (listOf(first) + pages).flatMap(EsportsExploreParser::playerMatches).distinctBy { it.id }
         }.getOrElse { cachedMatches.orEmpty() }.also { fresh ->
             ExploreMemory.playerMatches[id] = fresh
-            prefs.edit().putString(matchKey, gson.toJson(fresh)).putLong("${matchKey}_at", System.currentTimeMillis()).apply()
+            saveCached(matchKey, gson.toJson(fresh))
         }
         base.copy(matches = matches).let { loaded ->
             if(loaded.player.image == null) loaded.copy(player = loaded.player.copy(image = EsportsPortraits[url])) else loaded
         }.also {
             EsportsPortraits.remember(it.player)
             ExploreMemory.players[memoryKey] = it
-            prefs.edit().putString(key, gson.toJson(it)).putLong("${key}_at", System.currentTimeMillis()).apply()
+            saveCached(key, gson.toJson(it))
         }
     }
 }

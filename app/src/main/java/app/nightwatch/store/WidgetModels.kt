@@ -93,7 +93,7 @@ internal object WidgetModels {
                 val pool = when {
                     specific != null -> matches.filter { it.id == specific }
                     scope == "all" -> matches
-                    scope == "teams" -> matches.filter { it.team1 in teams || it.team2 in teams }
+                    scope == "teams" -> matches.filter { match -> teams.any { it.equals(match.team1, true) || it.equals(match.team2, true) } }
                     scope == "team" && !chosenTeam.isNullOrBlank() -> matches.filter { it.team1.equals(chosenTeam, true) || it.team2.equals(chosenTeam, true) }
                     else -> followed
                 }

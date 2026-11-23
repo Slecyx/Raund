@@ -154,12 +154,10 @@ internal object ScoreNotifications {
             (map.score2 ?: 0) > (map.score1 ?: 0) -> match.team2
             else -> null
         }
-        val title = if(hide) {
-            if(tr) "Harita tamamlandı" else "Map finished"
-        } else if(tr) {
-            "$winner · ${map.name} haritasını kazandı"
-        } else {
-            "$winner won ${map.name}"
+        val title = when {
+            hide || winner == null -> if(tr) "Harita tamamlandı · ${map.name}" else "Map finished · ${map.name}"
+            tr -> "$winner · ${map.name} haritasını kazandı"
+            else -> "$winner won ${map.name}"
         }
         val message = if(hide) match.event else if(tr) "Harita ${map.score1}–${map.score2} · Seri ${match.score}"
             else "Map ${map.score1}–${map.score2} · Series ${match.score}"
@@ -268,9 +266,7 @@ internal object BatteryPolicy {
 
 class UnfollowMatchReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        context.getSharedPreferences("nightwatch", Context.MODE_PRIVATE).edit().remove("tracked_match_id").apply()
-        context.stopService(Intent(context, LiveMatchService::class.java))
-        context.getSystemService(NotificationManager::class.java).cancel(ScoreNotifications.LIVE_ID)
+        EsportsScoreScheduler.unfollow(context)
     }
 }
 
@@ -281,11 +277,13 @@ class LiveMatchService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val matchId = intent?.getStringExtra("match_id") ?: getSharedPreferences("nightwatch", MODE_PRIVATE).getString("tracked_match_id", null)
         val label = intent?.getStringExtra("label").orEmpty()
-        if(matchId.isNullOrBlank()) { stopSelf(); return START_NOT_STICKY }
-        val placeholder = EsportsMatch(matchId, label.ifBlank { "VALORANT" }, "", null, null, "", "", "live", "", "")
+        val placeholder = EsportsMatch(matchId.orEmpty(), label.ifBlank { "VALORANT" }, "", null, null, "", "", "live", "", "")
         val notification = ScoreNotifications.item(this, placeholder, true)
         if(Build.VERSION.SDK_INT >= 29) startForeground(ScoreNotifications.LIVE_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         else startForeground(ScoreNotifications.LIVE_ID, notification)
+        if(matchId.isNullOrBlank() || !Regex("^[0-9]{1,12}$").matches(matchId)) {
+            stopForeground(STOP_FOREGROUND_REMOVE); stopSelf(); return START_NOT_STICKY
+        }
         getSharedPreferences("nightwatch", MODE_PRIVATE).edit().putString("tracked_match_id", matchId).apply()
         polling?.cancel()
         polling = scope.launch {
@@ -351,11 +349,20 @@ class TournamentLiveService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val incoming = runCatching { Gson().fromJson(intent?.getStringExtra("match"), EsportsMatch::class.java) }.getOrNull()
+        val incoming = runCatching { Gson().fromJson(intent?.getStringExtra("match"), EsportsMatch::class.java) }
+            .getOrNull()?.takeIf(MatchNavigation::valid)
         val initial = synchronized(TournamentLiveService::class.java) {
             (stored() + listOfNotNull(incoming)).distinctBy { it.id }.also { save(it) }
         }
-        if(initial.isEmpty()) { stopSelf(); return START_NOT_STICKY }
+        if(initial.isEmpty()) {
+            // Services started via startForegroundService must still call startForeground before stopping.
+            val placeholder = ScoreNotifications.summary(this, listOf(EsportsMatch("0", "VALORANT", "", null, null, "", "", "upcoming", "", "")))
+            if(Build.VERSION.SDK_INT >= 29) startForeground(ScoreNotifications.REALTIME_ID, placeholder, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            else startForeground(ScoreNotifications.REALTIME_ID, placeholder)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
         val notification = ScoreNotifications.summary(this, initial)
         synchronized(ScoreNotifications) {
             getSystemService(NotificationManager::class.java).cancel(ScoreNotifications.SUMMARY_ID)
@@ -436,7 +443,7 @@ class TournamentLiveService : Service() {
                 if(presentation != lastPresentation) {
                     lastPresentation = presentation
                     RaundWidgetProvider.updateAll(this@TournamentLiveService)
-                    if(prefs.getBoolean("notify_esports_live", true) || tracked != null)
+                    if((prefs.getBoolean("notify_esports_live", true) || tracked != null) && ScoreNotifications.permitted(this@TournamentLiveService))
                         getSystemService(NotificationManager::class.java)
                             .notify(ScoreNotifications.REALTIME_ID, ScoreNotifications.summary(this@TournamentLiveService, shown))
                 }
@@ -575,8 +582,12 @@ internal object EsportsScoreScheduler {
         monitorRealtime(context, match)
     }
     fun monitorRealtime(context: Context, match: EsportsMatch) {
-        ContextCompat.startForegroundService(context, Intent(context, TournamentLiveService::class.java)
-            .putExtra("match", Gson().toJson(match)))
+        if(!MatchNavigation.valid(match)) return
+        // Android 12+ can throw ForegroundServiceStartNotAllowedException from background triggers.
+        runCatching {
+            ContextCompat.startForegroundService(context, Intent(context, TournamentLiveService::class.java)
+                .putExtra("match", Gson().toJson(match)))
+        }
     }
     fun scheduleRapidResultCheck(context: Context, hasLiveMatches: Boolean) {
         val work = WorkManager.getInstance(context)
@@ -596,9 +607,30 @@ internal object EsportsScoreScheduler {
         work.beginUniqueWork(RAPID_WORK, ExistingWorkPolicy.APPEND_OR_REPLACE, request).enqueue()
     }
     fun unfollow(context: Context) {
-        context.getSharedPreferences("nightwatch", Context.MODE_PRIVATE).edit().remove("tracked_match_id").apply()
+        val prefs = context.getSharedPreferences("nightwatch", Context.MODE_PRIVATE)
+        val tracked = prefs.getString("tracked_match_id", null)
+        prefs.edit().remove("tracked_match_id").commit()
         context.stopService(Intent(context, LiveMatchService::class.java))
-        context.getSystemService(NotificationManager::class.java).cancel(ScoreNotifications.LIVE_ID)
+        val manager = context.getSystemService(NotificationManager::class.java)
+        manager.cancel(ScoreNotifications.LIVE_ID)
+        // Explicit tracking uses TournamentLiveService; drop the unpinned match immediately
+        // unless it is still followed via saved matches, favorite teams, or saved events.
+        synchronized(TournamentLiveService::class.java) {
+            val saved = SavedEsportsMatches.get(context).map { it.id }.toSet() + WidgetMatchFollows.ids(context)
+            val teams = prefs.getStringSet("esports_teams", emptySet()).orEmpty()
+            val events = SavedEsportsEvents.get(context).map { it.title }
+            val stored = runCatching {
+                Gson().fromJson(prefs.getString("esports_realtime_matches", "[]"), Array<EsportsMatch>::class.java).toList()
+            }.getOrDefault(emptyList())
+            val remaining = stored.filter { match ->
+                match.id != tracked || EsportsReminders.follows(match, saved, teams, events)
+            }
+            prefs.edit().putString("esports_realtime_matches", Gson().toJson(remaining)).commit()
+            if(remaining.isEmpty()) {
+                context.stopService(Intent(context, TournamentLiveService::class.java))
+                manager.cancel(ScoreNotifications.REALTIME_ID)
+            }
+        }
         EsportsReminders.refreshSoon(context)
     }
     fun syncSaved(context: Context, before: List<EsportsMatch>, after: List<EsportsMatch>) {

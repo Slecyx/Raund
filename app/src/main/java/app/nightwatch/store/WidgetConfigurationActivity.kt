@@ -24,9 +24,13 @@ class WidgetConfigurationActivity : ComponentActivity() {
         setResult(RESULT_CANCELED)
         val id = intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, AppWidgetManager.INVALID_APPWIDGET_ID)
         if(id == AppWidgetManager.INVALID_APPWIDGET_ID) { finish(); return }
-        val prefs = getSharedPreferences("raund_widgets", 0)
         val manager = AppWidgetManager.getInstance(this)
-        val defaultMode = RaundWidgetProvider.defaultMode(manager.getAppWidgetInfo(id)?.provider?.className)
+        val info = manager.getAppWidgetInfo(id)
+        // This activity must remain exported for the launcher, but it must only configure a
+        // widget allocated to this package. Reject arbitrary forged intents immediately.
+        if(info?.provider?.packageName != packageName) { finish(); return }
+        val prefs = getSharedPreferences("raund_widgets", 0)
+        val defaultMode = RaundWidgetProvider.defaultMode(info.provider.className)
         val tr = getSharedPreferences("nightwatch", 0).getString("language", Locale.getDefault().language.uppercase()) == "TR"
         val matches = WidgetModels.matches(this).filter { it.status != "result" }.sortedBy { it.startAtMillis ?: 0L }.take(40)
         val favoriteTeams = getSharedPreferences("nightwatch", 0).getStringSet("esports_teams", emptySet()).orEmpty().sorted()

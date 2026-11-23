@@ -29,7 +29,7 @@ internal object EsportsReminders {
     private fun prefs(context: Context) = context.getSharedPreferences("nightwatch", Context.MODE_PRIVATE)
     private fun intent(context: Context, id: String, monitor: Boolean) = Intent(context, EsportsReminderReceiver::class.java)
         .setAction(if(monitor) MONITOR_ACTION else "app.nightwatch.store.MATCH_REMINDER")
-        .setData(Uri.parse("valorshop://esports/${if(monitor) "monitor" else "reminder"}/$id"))
+        .setData(Uri.parse("raund://esports/${if(monitor) "monitor" else "reminder"}/$id"))
 
     private fun pending(context: Context, id: String, match: EsportsMatch? = null, monitor: Boolean = false): PendingIntent {
         val request = intent(context, id, monitor)
@@ -41,6 +41,15 @@ internal object EsportsReminders {
     fun exactAllowed(context: Context): Boolean = Build.VERSION.SDK_INT < 31 ||
         context.getSystemService(AlarmManager::class.java).canScheduleExactAlarms()
 
+    private const val LEGACY_ALARMS_CLEARED = "esports_legacy_alarms_cleared_v1"
+    private fun cancelLegacy(context: Context, alarm: AlarmManager, id: String, monitor: Boolean) {
+        val legacy = Intent(context, EsportsReminderReceiver::class.java)
+            .setAction(if(monitor) MONITOR_ACTION else "app.nightwatch.store.MATCH_REMINDER")
+            .setData(Uri.parse("valorshop://esports/${if(monitor) "monitor" else "reminder"}/$id"))
+        PendingIntent.getBroadcast(context, id.hashCode(), legacy, PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE)
+            ?.let { alarm.cancel(it); it.cancel() }
+    }
+
     fun sync(context: Context, candidates: List<EsportsMatch>) {
         val settings = prefs(context)
         val alarm = context.getSystemService(AlarmManager::class.java)
@@ -51,12 +60,21 @@ internal object EsportsReminders {
             (settings.getBoolean("notify_esports_reminders", true) || settings.getBoolean("notify_esports_results", true) ||
                 settings.getBoolean("notify_esports_maps", true) || settings.getBoolean("notify_esports_live", true))
         val now = System.currentTimeMillis()
+        // Following an entire tournament can expose hundreds of future rows. Only alarms that
+        // can realistically become relevant should exist on-device; the next worker refresh
+        // will schedule later rounds as the calendar advances.
         val wanted = if(!enabled) emptyList() else candidates.distinctBy { it.id }.filter { match ->
             match.status == "upcoming" && match.startAtMillis?.let { it > now } == true &&
                 follows(match, saved, teams, events)
-        }
+        }.sortedBy { it.startAtMillis }.take(24)
         val before = settings.getStringSet("esports_reminder_ids", emptySet()).orEmpty()
         val next = wanted.map { it.id }.toSet()
+        // Builds before 0.42.1 used the "valorshop" data scheme. Those alarms no longer match the
+        // current intents, so cancel them explicitly; otherwise they would fire alongside the new ones.
+        if(!settings.getBoolean(LEGACY_ALARMS_CLEARED, false)) {
+            before.forEach { id -> listOf(false, true).forEach { monitor -> cancelLegacy(context, alarm, id, monitor) } }
+            settings.edit().putBoolean(LEGACY_ALARMS_CLEARED, true).apply()
+        }
         (before - next).forEach { alarm.cancel(pending(context, it)); alarm.cancel(pending(context, it, monitor = true)) }
         wanted.forEach { match ->
             fun schedule(at: Long, monitor: Boolean) {
@@ -104,7 +122,8 @@ internal object EsportsTeamLinks {
 
 class EsportsReminderReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        val match = runCatching { Gson().fromJson(intent.getStringExtra("match"), EsportsMatch::class.java) }.getOrNull() ?: return
+        val match = runCatching { Gson().fromJson(intent.getStringExtra("match"), EsportsMatch::class.java) }.getOrNull()
+            ?.takeIf(MatchNavigation::valid) ?: return
         val prefs = context.getSharedPreferences("nightwatch", Context.MODE_PRIVATE)
         if(!prefs.getBoolean("match_alerts", true) || !ScoreNotifications.permitted(context)) return
         val saved = SavedEsportsMatches.get(context).any { it.id == match.id } || match.id in WidgetMatchFollows.ids(context)

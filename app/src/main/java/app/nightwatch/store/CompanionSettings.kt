@@ -9,6 +9,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -23,6 +24,9 @@ import kotlinx.coroutines.withContext
     val scope = rememberCoroutineScope()
     var historyOpen by remember { mutableStateOf(false) }
     var guideOpen by remember { mutableStateOf(false) }
+    var crosshairOpen by remember { mutableStateOf(false) }
+    var cacheBytes by remember { mutableLongStateOf(0L) }
+    LaunchedEffect(Unit) { cacheBytes = withContext(Dispatchers.IO) { CacheMaintenance.bytes(context) } }
     var restore by remember { mutableStateOf<RaundArchivePayload?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
     val success = txt("Full local archive saved. No sign-in information is included.", "Kapsamlı yerel yedek kaydedildi. Giriş bilgileri dahil edilmez.")
@@ -60,6 +64,24 @@ import kotlinx.coroutines.withContext
     if(guideOpen) RaundQuickGuide(onDismiss = { guideOpen = false }, onConnect = { guideOpen = false; onConnect() })
     TextButton(onClick = { historyOpen = true }, modifier = Modifier.fillMaxWidth()) {
         Text(txt("Notification history & diagnostics", "Bildirim geçmişi ve teşhis"))
+    }
+    TextButton(onClick = { crosshairOpen = true }, modifier = Modifier.fillMaxWidth()) {
+        Text(txt("Pro crosshair library", "Pro nişangâh kütüphanesi"))
+    }
+    if(crosshairOpen) CrosshairLibraryDialog { crosshairOpen = false }
+    val cacheClearedMessage = txt("Public caches cleared. Your sign-in and favorites are untouched.", "Genel önbellek temizlendi. Oturumun ve favorilerin korundu.")
+    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(txt("Public cache", "Genel önbellek"), color = White, fontSize = 14.sp)
+            Text(txt("Catalog, esports and news · ", "Katalog, espor ve haberler · ") + CacheMaintenance.formatSize(cacheBytes), color = Muted, fontSize = 11.sp)
+        }
+        TextButton(onClick = {
+            scope.launch {
+                withContext(Dispatchers.IO) { CacheMaintenance.clearPublicCaches(context) }
+                cacheBytes = withContext(Dispatchers.IO) { CacheMaintenance.bytes(context) }
+                message = cacheClearedMessage
+            }
+        }) { Text(txt("Clear", "Temizle")) }
     }
     Text(txt("Full local archive", "Kapsamlı yerel yedek"), color = White, fontSize = 15.sp, modifier = Modifier.padding(top = 12.dp))
     Text(txt("Preferences, favorites, follows, widgets, notification settings, Store, Career, season progress and inventory. Your Riot session stays on this device.",

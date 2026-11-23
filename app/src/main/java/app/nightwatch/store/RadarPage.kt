@@ -49,7 +49,9 @@ import java.util.Locale
     val selected = available.filter { it.id in selectedIds }
     val total = selected.sumOf { it.priceVp.toLong() }
     val budget = budgetText.toLongOrNull()
-    val favorites = (account?.snapshot?.offers.orEmpty() + catalog).distinctBy { it.id }.filter { it.id in wished }
+    val favorites = (account?.snapshot?.offers.orEmpty() + account?.snapshot?.nightOffers.orEmpty() +
+        account?.snapshot?.accessories.orEmpty() + account?.snapshot?.bundles.orEmpty().flatMap { it.items } +
+        catalog).distinctBy { it.id }.filter { it.id in wished }
     val tr = LocalTurkish.current
     fun date(seconds: Long): String = Instant.ofEpochSecond(seconds).atZone(ZoneId.systemDefault())
         .format(DateTimeFormatter.ofPattern("d MMM · HH:mm", if(tr) Locale.forLanguageTag("tr") else Locale.ENGLISH))
@@ -116,6 +118,15 @@ import java.util.Locale
                 SectionTitle(txt("Store memory","Mağaza hafızası"), "${history.size}/30")
                 if(historyLoading) LinearProgressIndicator(Modifier.fillMaxWidth())
                 if(history.isEmpty() && !historyLoading) Empty(txt("The first page is yours","İlk sayfa seni bekliyor"), txt("A successful live store refresh starts your history. Old rotations cannot be recovered.","İlk başarılı canlı mağaza yenilemesiyle kayıt başlar. Geçmiş günler geriye dönük alınamaz."))
+                if(history.isNotEmpty()) {
+                    val stats = remember(history) { RadarHistory.summary(history) }
+                    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                        Stat(stats.rotations.toString(), txt("Days logged", "Kayıtlı gün"), Modifier.weight(1f))
+                        Stat(stats.uniqueSkins.toString(), txt("Unique skins", "Farklı skin"), Modifier.weight(1f))
+                        Stat(stats.topWeapon?.let { "$it (${stats.topWeaponCount})" } ?: "—", txt("Most seen", "En sık çıkan"), Modifier.weight(1.2f))
+                    }
+                    HorizontalDivider(color = Raised.copy(alpha = .55f))
+                }
                 if(history.size >= 2) {
                     val change = RadarHistory.changes(history[history.lastIndex-1], history.last())
                     Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
