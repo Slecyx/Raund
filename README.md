@@ -9,6 +9,7 @@
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.3-7F52FF?logo=kotlin&logoColor=white)](https://kotlinlang.org/)
 [![Jetpack Compose](https://img.shields.io/badge/Jetpack%20Compose-Material%203-4285F4?logo=jetpackcompose&logoColor=white)](https://developer.android.com/jetpack/compose)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Download APK](https://img.shields.io/badge/Download-APK%20(Releases)-FF4655?logo=android&logoColor=white)](https://github.com/Slecyx/Raund/releases/latest)
 
 </div>
 
